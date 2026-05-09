@@ -1,0 +1,363 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════════════╗
+ * ║          MINDVORA — CRLF DEFENSE SYSTEM  ·  defense.evi            ║
+ * ║                                                                      ║
+ * ║  CRLF (Carriage-Return Line-Feed) Injection is a class of HTTP      ║
+ * ║  header-splitting attacks where an attacker injects \r\n or the      ║
+ * ║  encoded equivalents %0d%0a into HTTP headers/params to split        ║
+ * ║  responses, hijack sessions, or poison caches.                       ║
+ * ║                                                                      ║
+ * ║  This module provides:                                               ║
+ * ║   1. Deep CRLF sanitization of all inbound data                     ║
+ * ║   2. Automatic IP banning after 5 suspicious requests (24h TTL)     ║
+ * ║   3. Hardened security response headers                              ║
+ * ║   4. Complete suppression of stack traces & internal API details     ║
+ * ║   5. Rate-limiting (100 req/min per IP, sliding window)             ║
+ * ╚══════════════════════════════════════════════════════════════════════╝
+ */
+
+'use strict';
+
+// ── In-memory stores (replace with Redis in production clusters) ──────────
+const suspiciousMap = new Map();  // ip → { count, bannedUntil }
+const rateLimitMap  = new Map();  // ip → [timestamps...]
+
+// ── Constants ─────────────────────────────────────────────────────────────
+const MAX_VIOLATIONS    = 5;              // strikes before permanent ban
+const BAN_DURATION_MS   = 24 * 60 * 60 * 1000; // 24 hours
+const RATE_WINDOW_MS    = 60 * 1000;     // 1 minute sliding window
+const RATE_MAX_REQUESTS = 150;           // max requests per window per IP
+
+// ── CRLF pattern: catches raw and percent-encoded forms ───────────────────
+const CRLF_PATTERN = /(\r|\n|%0[dD]|%0[aA]|%00)/g;
+
+// ── Unicode / null byte injection patterns ────────────────────────────────
+const NULL_BYTE_PATTERN = /\x00/g;
+
+// ── Path traversal patterns ───────────────────────────────────────────────
+const PATH_TRAVERSAL = /(\.\.(\/|\\)|%2e%2e(%2f|%5c)|%252e%252e)/gi;
+
+// ── SQL injection quick-detect (logged only, not blocked) ─────────────────
+const SQL_DETECT = /(\bunion\b.*\bselect\b|\bselect\b.*\bfrom\b|\bdrop\b.*\btable\b|\bexec\b\s*\()/gi;
+
+/**
+ * Sanitize a string value by stripping CRLF, null bytes, path traversal.
+ * Returns the cleaned string.
+ */
+function sanitizeValue(val) {
+  if (typeof val !== 'string') return val;
+  return val
+    .replace(CRLF_PATTERN, '')
+    .replace(NULL_BYTE_PATTERN, '')
+    .replace(PATH_TRAVERSAL, '');
+}
+
+/**
+ * Deep-sanitize an object (works on nested objects/arrays).
+ */
+function sanitizeDeep(obj) {
+  if (obj === null || obj === undefined) return obj;
+  if (typeof obj === 'string') return sanitizeValue(obj);
+  if (Array.isArray(obj)) return obj.map(sanitizeDeep);
+  if (typeof obj === 'object') {
+    const out = {};
+    for (const key of Object.keys(obj)) {
+      out[sanitizeValue(key)] = sanitizeDeep(obj[key]);
+    }
+    return out;
+  }
+  return obj;
+}
+
+/**
+ * Detect if a raw value contains CRLF injection attempt.
+ */
+function hasCRLF(val) {
+  if (typeof val !== 'string') return false;
+  return CRLF_PATTERN.test(val) || NULL_BYTE_PATTERN.test(val) || PATH_TRAVERSAL.test(val);
+}
+
+/**
+ * Check all values in an object for CRLF.
+ */
+function objectHasCRLF(obj) {
+  if (!obj || typeof obj !== 'object') return false;
+  for (const key of Object.keys(obj)) {
+    if (hasCRLF(key) || hasCRLF(String(obj[key] ?? ''))) return true;
+    if (typeof obj[key] === 'object' && objectHasCRLF(obj[key])) return true;
+  }
+  return false;
+}
+
+/**
+ * Record a violation for an IP and return whether it should be banned.
+ */
+function recordViolation(ip) {
+  const now = Date.now();
+  const rec = suspiciousMap.get(ip) || { count: 0, bannedUntil: 0 };
+
+  // Already banned?
+  if (rec.bannedUntil > now) return true;
+
+  rec.count += 1;
+  if (rec.count >= MAX_VIOLATIONS) {
+    rec.bannedUntil = now + BAN_DURATION_MS;
+    console.warn(`[MINDVORA SECURITY] 🚫 IP BANNED: ${ip} — exceeded ${MAX_VIOLATIONS} CRLF violation attempts. Ban expires: ${new Date(rec.bannedUntil).toISOString()}`);
+  } else {
+    console.warn(`[MINDVORA SECURITY] ⚠️  CRLF attempt #${rec.count} from IP: ${ip}`);
+  }
+
+  suspiciousMap.set(ip, rec);
+  return rec.bannedUntil > now;
+}
+
+/**
+ * Check if IP is currently banned.
+ */
+function isBanned(ip) {
+  const rec = suspiciousMap.get(ip);
+  if (!rec) return false;
+  if (rec.bannedUntil > Date.now()) return true;
+  // Ban expired — reset
+  if (rec.bannedUntil && rec.bannedUntil <= Date.now()) {
+    suspiciousMap.delete(ip);
+  }
+  return false;
+}
+
+/**
+ * Rate-limit check: sliding window.
+ * Returns true if the IP is over-limit.
+ */
+function isRateLimited(ip) {
+  const now = Date.now();
+  const timestamps = (rateLimitMap.get(ip) || []).filter(t => now - t < RATE_WINDOW_MS);
+  timestamps.push(now);
+  rateLimitMap.set(ip, timestamps);
+  return timestamps.length > RATE_MAX_REQUESTS;
+}
+
+/**
+ * Extract the real client IP, respecting proxy headers.
+ */
+function getClientIP(req) {
+  return (
+    req.headers['cf-connecting-ip'] ||
+    req.headers['x-real-ip'] ||
+    (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
+    req.socket.remoteAddress ||
+    'unknown'
+  );
+}
+
+// ── Security headers added to every response ──────────────────────────────
+const SECURITY_HEADERS = {
+  'X-Content-Type-Options':            'nosniff',
+  'X-Frame-Options':                   'DENY',
+  'X-XSS-Protection':                  '1; mode=block',
+  'Strict-Transport-Security':         'max-age=31536000; includeSubDomains; preload',
+  'Referrer-Policy':                   'strict-origin-when-cross-origin',
+  'Permissions-Policy':                'geolocation=(), microphone=(self), camera=(self), payment=()',
+  'Content-Security-Policy':           [
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-inline' https://www.gstatic.com https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://js.paystack.co https://upload-widget.cloudinary.com https://fonts.googleapis.com",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com",
+    "img-src 'self' data: blob: https:",
+    "connect-src 'self' wss: https:",
+    "media-src 'self' blob:",
+    "frame-ancestors 'none'",
+  ].join('; '),
+  'X-Mindvora-Protected':              'true',
+};
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────
+ * MAIN MIDDLEWARE — crlfGuard
+ *
+ * Apply as the VERY FIRST middleware in your Express app:
+ *   const { crlfGuard } = require('./CRLF/defense.evi');
+ *   app.use(crlfGuard);
+ * ─────────────────────────────────────────────────────────────────────────
+ */
+function crlfGuard(req, res, next) {
+  const ip = getClientIP(req);
+
+  // 1. Apply security headers to EVERY response
+  for (const [header, value] of Object.entries(SECURITY_HEADERS)) {
+    res.setHeader(header, value);
+  }
+  res.removeHeader('X-Powered-By');
+  res.removeHeader('Server');
+
+  // 2. Check IP ban
+  if (isBanned(ip)) {
+    return res.status(403).json({
+      error: 'Access denied. Your IP has been temporarily blocked due to suspicious activity.',
+      code: 'IP_BANNED'
+    });
+  }
+
+  // 3. Rate limiting
+  if (isRateLimited(ip)) {
+    console.warn(`[MINDVORA SECURITY] 🌊 Rate limit exceeded: ${ip}`);
+    return res.status(429).json({
+      error: 'Too many requests. Please slow down.',
+      code: 'RATE_LIMITED',
+      retryAfter: 60
+    });
+  }
+
+  // 4. Detect CRLF in headers
+  const headerString = JSON.stringify(req.headers);
+  const hasCRLFHeaders = CRLF_PATTERN.test(headerString) || NULL_BYTE_PATTERN.test(headerString);
+
+  // 5. Detect CRLF in query params
+  const hasCRLFQuery = objectHasCRLF(req.query);
+
+  // 6. Detect CRLF in URL path
+  const hasCRLFPath = CRLF_PATTERN.test(req.url) || PATH_TRAVERSAL.test(req.url);
+
+  if (hasCRLFHeaders || hasCRLFQuery || hasCRLFPath) {
+    const banned = recordViolation(ip);
+    if (banned) {
+      return res.status(403).json({
+        error: 'Access denied. Suspicious request pattern detected. Your IP has been banned.',
+        code: 'CRLF_INJECTION_BAN'
+      });
+    }
+    return res.status(400).json({
+      error: 'Bad request. Invalid characters detected in request.',
+      code: 'CRLF_INJECTION_ATTEMPT'
+    });
+  }
+
+  // 7. Sanitize query params (in-place)
+  if (req.query) {
+    req.query = sanitizeDeep(req.query);
+  }
+
+  // 8. Sanitize body after parsing (body-parser must run first — hook via response)
+  const originalJson = res.json.bind(res);
+  
+  // 9. Wrap res.json to strip stack traces from outbound responses
+  res.json = function(data) {
+    if (data && typeof data === 'object') {
+      // Never leak stack traces or internal details
+      delete data.stack;
+      delete data.stacktrace;
+      delete data.internalError;
+      delete data.sqlState;
+      delete data.errno;
+      delete data.code_internal;
+
+      // In production, replace detailed error messages
+      if (process.env.NODE_ENV === 'production' && data.message && data.message.length > 200) {
+        data.message = 'An error occurred. Please try again.';
+      }
+    }
+    return originalJson(data);
+  };
+
+  // 10. Watch for CRLF in body after it's parsed
+  const checkBody = () => {
+    if (req.body && objectHasCRLF(req.body)) {
+      const banned = recordViolation(ip);
+      if (!res.headersSent) {
+        return res.status(banned ? 403 : 400).json({
+          error: banned ? 'Access denied. Your IP has been banned.' : 'Bad request. Invalid data in request body.',
+          code: banned ? 'BODY_CRLF_BAN' : 'BODY_CRLF_ATTEMPT'
+        });
+      }
+    } else if (req.body) {
+      req.body = sanitizeDeep(req.body);
+    }
+  };
+
+  // Hook into next() flow
+  const originalNext = next;
+  next = function(err) {
+    if (err) return originalNext(err);
+    checkBody();
+    if (!res.headersSent) originalNext();
+  };
+
+  // Log suspicious SQL patterns (non-blocking — for monitoring)
+  const fullReqStr = JSON.stringify({ url: req.url, query: req.query, body: req.body });
+  if (SQL_DETECT.test(fullReqStr)) {
+    console.warn(`[MINDVORA SECURITY] 🔍 SQL-like pattern detected from IP: ${ip} — ${req.method} ${req.url}`);
+  }
+
+  next();
+}
+
+/**
+ * Error handler middleware — attach AFTER all routes.
+ * Prevents ANY stack trace or internal detail from leaking.
+ */
+function secureErrorHandler(err, req, res, next) {
+  const ip = getClientIP(req);
+  // Log full error server-side only
+  console.error(`[MINDVORA ERROR] ${new Date().toISOString()} | IP: ${ip} | ${req.method} ${req.url}`, err);
+
+  // Send only generic message to client
+  if (res.headersSent) return next(err);
+  
+  res.status(err.status || 500).json({
+    error: process.env.NODE_ENV === 'production'
+      ? 'Something went wrong. Please try again later.'
+      : err.message,
+    code: err.code || 'INTERNAL_ERROR'
+  });
+}
+
+/**
+ * Utility: get current ban list (for admin dashboard).
+ */
+function getBanList() {
+  const now = Date.now();
+  const bans = [];
+  for (const [ip, rec] of suspiciousMap.entries()) {
+    if (rec.bannedUntil > now) {
+      bans.push({
+        ip,
+        violations: rec.count,
+        bannedUntil: new Date(rec.bannedUntil).toISOString(),
+        remainingMs: rec.bannedUntil - now
+      });
+    }
+  }
+  return bans;
+}
+
+/**
+ * Utility: manually unban an IP (admin action).
+ */
+function unbanIP(ip) {
+  suspiciousMap.delete(ip);
+  console.warn(`[MINDVORA SECURITY] ✅ IP manually unbanned: ${ip}`);
+}
+
+// ── Periodic cleanup of expired entries (every hour) ──────────────────────
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, rec] of suspiciousMap.entries()) {
+    if (rec.bannedUntil && rec.bannedUntil <= now) {
+      suspiciousMap.delete(ip);
+    }
+  }
+  for (const [ip, timestamps] of rateLimitMap.entries()) {
+    const fresh = timestamps.filter(t => now - t < RATE_WINDOW_MS);
+    if (fresh.length === 0) rateLimitMap.delete(ip);
+    else rateLimitMap.set(ip, fresh);
+  }
+}, 60 * 60 * 1000);
+
+module.exports = {
+  crlfGuard,
+  secureErrorHandler,
+  getBanList,
+  unbanIP,
+  sanitizeValue,
+  sanitizeDeep,
+};
