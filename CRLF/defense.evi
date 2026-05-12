@@ -18,20 +18,22 @@
 
 'use strict';
 
-const admin = require('firebase-admin');
-
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId:   process.env.FIREBASE_PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey:  process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-    })
-  });
+let firestore = null;
+try {
+  const admin = require('firebase-admin');
+  if (!admin.apps.length) {
+    admin.initializeApp({
+      credential: admin.credential.cert({
+        projectId:   process.env.FIREBASE_PROJECT_ID,
+        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        privateKey:  process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      })
+    });
+  }
+  firestore = admin.firestore();
+} catch(e) {
+  console.warn('[MINDVORA] Firebase Admin not available — using memory fallback');
 }
-
-const firestore = admin.firestore();
-const BANS_COLLECTION = 'crlf_bans';
 
 // ── In-memory store for rate limiting only ────────────────────────────────
 const rateLimitMap = new Map();
