@@ -18,13 +18,27 @@
 
 'use strict';
 
-// ── In-memory stores (replace with Redis in production clusters) ──────────
-const suspiciousMap = new Map();  // ip → { count, bannedUntil }
-const rateLimitMap  = new Map();  // ip → [timestamps...]
+const admin = require('firebase-admin');
+
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId:   process.env.FIREBASE_PROJECT_ID,
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+      privateKey:  process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+    })
+  });
+}
+
+const firestore = admin.firestore();
+const BANS_COLLECTION = 'crlf_bans';
+
+// ── In-memory store for rate limiting only ────────────────────────────────
+const rateLimitMap = new Map();
 
 // ── Constants ─────────────────────────────────────────────────────────────
-const MAX_VIOLATIONS    = 5;              // strikes before permanent ban
-const BAN_DURATION_MS   = 24 * 60 * 60 * 1000; // 24 hours
+const MAX_VIOLATIONS    = 5;             // strikes before permanent ban
+const BAN_DURATION_MS   = -1;            // Permanent — never expires
 const RATE_WINDOW_MS    = 60 * 1000;     // 1 minute sliding window
 const RATE_MAX_REQUESTS = 150;           // max requests per window per IP
 
@@ -92,36 +106,34 @@ function objectHasCRLF(obj) {
 /**
  * Record a violation for an IP and return whether it should be banned.
  */
-function recordViolation(ip) {
-  const now = Date.now();
-  const rec = suspiciousMap.get(ip) || { count: 0, bannedUntil: 0 };
+async function recordViolation(ip) {
+  const ref = firestore.collection(BANS_COLLECTION).doc(ip.replace(/:/g, '_'));
+  const doc = await ref.get();
+  const rec = doc.exists ? doc.data() : { count: 0, bannedUntil: 0 };
 
-  // Already banned?
-  if (rec.bannedUntil > now) return true;
+  if (rec.bannedUntil === -1) return true; // Already permanently banned
 
   rec.count += 1;
   if (rec.count >= MAX_VIOLATIONS) {
-    rec.bannedUntil = now + BAN_DURATION_MS;
-    console.warn(`[MINDVORA SECURITY] 🚫 IP BANNED: ${ip} — exceeded ${MAX_VIOLATIONS} CRLF violation attempts. Ban expires: ${new Date(rec.bannedUntil).toISOString()}`);
+    rec.bannedUntil = -1; // Permanent ban
+    console.warn(`[MINDVORA SECURITY] 🚫 IP PERMANENTLY BANNED: ${ip}`);
   } else {
-    console.warn(`[MINDVORA SECURITY] ⚠️  CRLF attempt #${rec.count} from IP: ${ip}`);
+    console.warn(`[MINDVORA SECURITY] ⚠️ CRLF attempt #${rec.count} from IP: ${ip}`);
   }
 
-  suspiciousMap.set(ip, rec);
-  return rec.bannedUntil > now;
+  await ref.set(rec);
+  return rec.bannedUntil === -1;
 }
 
 /**
  * Check if IP is currently banned.
  */
-function isBanned(ip) {
-  const rec = suspiciousMap.get(ip);
-  if (!rec) return false;
-  if (rec.bannedUntil > Date.now()) return true;
-  // Ban expired — reset
-  if (rec.bannedUntil && rec.bannedUntil <= Date.now()) {
-    suspiciousMap.delete(ip);
-  }
+async function isBanned(ip) {
+  const ref = firestore.collection(BANS_COLLECTION).doc(ip.replace(/:/g, '_'));
+  const doc = await ref.get();
+  if (!doc.exists) return false;
+  const rec = doc.data();
+  if (rec.bannedUntil === -1) return true; // Permanent ban
   return false;
 }
 
@@ -180,7 +192,7 @@ const SECURITY_HEADERS = {
  *   app.use(crlfGuard);
  * ─────────────────────────────────────────────────────────────────────────
  */
-function crlfGuard(req, res, next) {
+async function crlfGuard(req, res, next) {
   const ip = getClientIP(req);
 
   // 1. Apply security headers to EVERY response
@@ -191,7 +203,7 @@ function crlfGuard(req, res, next) {
   res.removeHeader('Server');
 
   // 2. Check IP ban
-  if (isBanned(ip)) {
+  if (await isBanned(ip)) {
     return res.status(403).json({
       error: 'Access denied. Your IP has been temporarily blocked due to suspicious activity.',
       code: 'IP_BANNED'
@@ -219,7 +231,7 @@ function crlfGuard(req, res, next) {
   const hasCRLFPath = CRLF_PATTERN.test(req.url) || PATH_TRAVERSAL.test(req.url);
 
   if (hasCRLFHeaders || hasCRLFQuery || hasCRLFPath) {
-    const banned = recordViolation(ip);
+    const banned = await recordViolation(ip);
     if (banned) {
       return res.status(403).json({
         error: 'Access denied. Suspicious request pattern detected. Your IP has been banned.',
@@ -314,38 +326,33 @@ function secureErrorHandler(err, req, res, next) {
 /**
  * Utility: get current ban list (for admin dashboard).
  */
-function getBanList() {
-  const now = Date.now();
+async function getBanList() {
+  const snapshot = await firestore.collection(BANS_COLLECTION).get();
   const bans = [];
-  for (const [ip, rec] of suspiciousMap.entries()) {
-    if (rec.bannedUntil > now) {
-      bans.push({
-        ip,
-        violations: rec.count,
-        bannedUntil: new Date(rec.bannedUntil).toISOString(),
-        remainingMs: rec.bannedUntil - now
-      });
-    }
-  }
+  snapshot.forEach(doc => {
+    const rec = doc.data();
+    bans.push({
+      ip: doc.id.replace(/_/g, ':'),
+      violations: rec.count,
+      bannedUntil: 'PERMANENT',
+      remainingMs: 'PERMANENT'
+    });
+  });
   return bans;
 }
 
 /**
  * Utility: manually unban an IP (admin action).
  */
-function unbanIP(ip) {
-  suspiciousMap.delete(ip);
+async function unbanIP(ip) {
+  const ref = firestore.collection(BANS_COLLECTION).doc(ip.replace(/:/g, '_'));
+  await ref.delete();
   console.warn(`[MINDVORA SECURITY] ✅ IP manually unbanned: ${ip}`);
 }
 
 // ── Periodic cleanup of expired entries (every hour) ──────────────────────
 setInterval(() => {
   const now = Date.now();
-  for (const [ip, rec] of suspiciousMap.entries()) {
-    if (rec.bannedUntil && rec.bannedUntil <= now) {
-      suspiciousMap.delete(ip);
-    }
-  }
   for (const [ip, timestamps] of rateLimitMap.entries()) {
     const fresh = timestamps.filter(t => now - t < RATE_WINDOW_MS);
     if (fresh.length === 0) rateLimitMap.delete(ip);
