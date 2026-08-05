@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: mindvora-backend
+    runtime: node
+    plan: free
+    repo: https://github.com/ilohgreat-25x/mindvora-backend
+    branch: main
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
