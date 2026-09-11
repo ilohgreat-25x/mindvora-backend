@@ -1,44 +1,29 @@
-/**
- * ╔══════════════════════════════════════════════════════════════════════╗
- * ║          MINDVORA — CRLF DEFENSE SYSTEM  ·  defense.evi            ║
- * ║                                                                      ║
- * ║  CRLF (Carriage-Return Line-Feed) Injection is a class of HTTP      ║
- * ║  header-splitting attacks where an attacker injects \r\n or the      ║
- * ║  encoded equivalents %0d%0a into HTTP headers/params to split        ║
- * ║  responses, hijack sessions, or poison caches.                       ║
- * ║                                                                      ║
- * ║  This module provides:                                               ║
- * ║   1. Deep CRLF sanitization of all inbound data                     ║
- * ║   2. Automatic IP banning after 5 suspicious requests (24h TTL)     ║
- * ║   3. Hardened security response headers                              ║
- * ║   4. Complete suppression of stack traces & internal API details     ║
- * ║   5. Rate-limiting (100 req/min per IP, sliding window)             ║
- * ╚══════════════════════════════════════════════════════════════════════╝
- */
-
+// CRLF defense middleware: sanitizes inbound data, auto-bans offending IPs,
+// sets security headers, and hides internal error details.
 'use strict';
 
-// ── In-memory stores (replace with Redis in production clusters) ──────────
+// In-memory stores
 const suspiciousMap = new Map();  // ip → { count, bannedUntil }
 const rateLimitMap  = new Map();  // ip → [timestamps...]
 
-// ── Constants ─────────────────────────────────────────────────────────────
+// Constants
 const MAX_VIOLATIONS    = 5;              // strikes before permanent ban
 const BAN_DURATION_MS   = 24 * 60 * 60 * 1000; // 24 hours
 const RATE_WINDOW_MS    = 60 * 1000;     // 1 minute sliding window
 const RATE_MAX_REQUESTS = 150;           // max requests per window per IP
 
-// ── CRLF pattern: catches raw and percent-encoded forms ───────────────────
+// CRLF patterns: separate test (non-global) and replace (global) forms
+// The /g flag must NOT be used with .test(), because it keeps a lastIndex
+// cursor and makes matches alternate between true/false on repeat calls.
+const CRLF_TEST    = /(\r|\n|%0[dD]|%0[aA]|%00)/;
 const CRLF_PATTERN = /(\r|\n|%0[dD]|%0[aA]|%00)/g;
 
-// ── Unicode / null byte injection patterns ────────────────────────────────
-const NULL_BYTE_PATTERN = /\x00/g;
+const NULL_BYTE_PATTERN = /\x00/;
 
-// ── Path traversal patterns ───────────────────────────────────────────────
-const PATH_TRAVERSAL = /(\.\.(\/|\\)|%2e%2e(%2f|%5c)|%252e%252e)/gi;
+const PATH_TRAVERSAL_TEST    = /(\.\.(\/|\\)|%2e%2e(%2f|%5c)|%252e%252e)/i;
+const PATH_TRAVERSAL_REPLACE = /(\.\.(\/|\\)|%2e%2e(%2f|%5c)|%252e%252e)/gi;
 
-// ── SQL injection quick-detect (logged only, not blocked) ─────────────────
-const SQL_DETECT = /(\bunion\b.*\bselect\b|\bselect\b.*\bfrom\b|\bdrop\b.*\btable\b|\bexec\b\s*\()/gi;
+const SQL_DETECT = /(\bunion\b.*\bselect\b|\bselect\b.*\bfrom\b|\bdrop\b.*\btable\b|\bexec\b\s*\()/i;
 
 /**
  * Sanitize a string value by stripping CRLF, null bytes, path traversal.
@@ -49,7 +34,7 @@ function sanitizeValue(val) {
   return val
     .replace(CRLF_PATTERN, '')
     .replace(NULL_BYTE_PATTERN, '')
-    .replace(PATH_TRAVERSAL, '');
+    .replace(PATH_TRAVERSAL_REPLACE, '');
 }
 
 /**
@@ -74,7 +59,7 @@ function sanitizeDeep(obj) {
  */
 function hasCRLF(val) {
   if (typeof val !== 'string') return false;
-  return CRLF_PATTERN.test(val) || NULL_BYTE_PATTERN.test(val) || PATH_TRAVERSAL.test(val);
+  return CRLF_TEST.test(val) || NULL_BYTE_PATTERN.test(val) || PATH_TRAVERSAL_TEST.test(val);
 }
 
 /**
@@ -96,7 +81,7 @@ function recordViolation(ip) {
   const now = Date.now();
   const rec = suspiciousMap.get(ip) || { count: 0, bannedUntil: 0 };
 
-  // Already banned?
+// Already banned?
   if (rec.bannedUntil > now) return true;
 
   rec.count += 1;
@@ -118,7 +103,7 @@ function isBanned(ip) {
   const rec = suspiciousMap.get(ip);
   if (!rec) return false;
   if (rec.bannedUntil > Date.now()) return true;
-  // Ban expired — reset
+// Ban expired — reset
   if (rec.bannedUntil && rec.bannedUntil <= Date.now()) {
     suspiciousMap.delete(ip);
   }
@@ -138,19 +123,22 @@ function isRateLimited(ip) {
 }
 
 /**
- * Extract the real client IP, respecting proxy headers.
+ * Extract the real client IP.
+ * Uses Express's req.ip (which honours `trust proxy`), falling back to the
+ * socket address. Client-supplied X-Forwarded-For / X-Real-IP headers are
+ * NOT trusted here, because they can be spoofed by anyone.
  */
 function getClientIP(req) {
-  return (
-    req.headers['cf-connecting-ip'] ||
-    req.headers['x-real-ip'] ||
-    (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
-    req.socket.remoteAddress ||
-    'unknown'
-  );
+  if (req && req.ip && req.ip !== '::1' && req.ip !== '::ffff:127.0.0.1') {
+    return req.ip;
+  }
+  if (req && req.socket && req.socket.remoteAddress) {
+    return req.socket.remoteAddress;
+  }
+  return 'unknown';
 }
 
-// ── Security headers added to every response ──────────────────────────────
+// Security headers added to every response
 const SECURITY_HEADERS = {
   'X-Content-Type-Options':            'nosniff',
   'X-Frame-Options':                   'DENY',
@@ -183,14 +171,14 @@ const SECURITY_HEADERS = {
 function crlfGuard(req, res, next) {
   const ip = getClientIP(req);
 
-  // 1. Apply security headers to EVERY response
+// 1. Apply security headers to EVERY response
   for (const [header, value] of Object.entries(SECURITY_HEADERS)) {
     res.setHeader(header, value);
   }
   res.removeHeader('X-Powered-By');
   res.removeHeader('Server');
 
-  // 2. Check IP ban
+// 2. Check IP ban
   if (isBanned(ip)) {
     return res.status(403).json({
       error: 'Access denied. Your IP has been temporarily blocked due to suspicious activity.',
@@ -198,7 +186,7 @@ function crlfGuard(req, res, next) {
     });
   }
 
-  // 3. Rate limiting
+// 3. Rate limiting
   if (isRateLimited(ip)) {
     console.warn(`[MINDVORA SECURITY] 🌊 Rate limit exceeded: ${ip}`);
     return res.status(429).json({
@@ -208,15 +196,15 @@ function crlfGuard(req, res, next) {
     });
   }
 
-  // 4. Detect CRLF in headers
+// 4. Detect CRLF in headers
   const headerString = JSON.stringify(req.headers);
-  const hasCRLFHeaders = CRLF_PATTERN.test(headerString) || NULL_BYTE_PATTERN.test(headerString);
+  const hasCRLFHeaders = CRLF_TEST.test(headerString) || NULL_BYTE_PATTERN.test(headerString);
 
-  // 5. Detect CRLF in query params
+// 5. Detect CRLF in query params
   const hasCRLFQuery = objectHasCRLF(req.query);
 
-  // 6. Detect CRLF in URL path
-  const hasCRLFPath = CRLF_PATTERN.test(req.url) || PATH_TRAVERSAL.test(req.url);
+// 6. Detect CRLF in URL path
+  const hasCRLFPath = CRLF_TEST.test(req.url) || PATH_TRAVERSAL_TEST.test(req.url);
 
   if (hasCRLFHeaders || hasCRLFQuery || hasCRLFPath) {
     const banned = recordViolation(ip);
@@ -232,18 +220,18 @@ function crlfGuard(req, res, next) {
     });
   }
 
-  // 7. Sanitize query params (in-place)
+// 7. Sanitize query params (in-place)
   if (req.query) {
     req.query = sanitizeDeep(req.query);
   }
 
-  // 8. Sanitize body after parsing (body-parser must run first — hook via response)
+// 8. Sanitize body after parsing (body-parser must run first — hook via response)
   const originalJson = res.json.bind(res);
   
-  // 9. Wrap res.json to strip stack traces from outbound responses
+// 9. Wrap res.json to strip stack traces from outbound responses
   res.json = function(data) {
     if (data && typeof data === 'object') {
-      // Never leak stack traces or internal details
+// Never leak stack traces or internal details
       delete data.stack;
       delete data.stacktrace;
       delete data.internalError;
@@ -251,7 +239,7 @@ function crlfGuard(req, res, next) {
       delete data.errno;
       delete data.code_internal;
 
-      // In production, replace detailed error messages
+// In production, replace detailed error messages
       if (process.env.NODE_ENV === 'production' && data.message && data.message.length > 200) {
         data.message = 'An error occurred. Please try again.';
       }
@@ -259,7 +247,7 @@ function crlfGuard(req, res, next) {
     return originalJson(data);
   };
 
-  // 10. Watch for CRLF in body after it's parsed
+// 10. Watch for CRLF in body after it's parsed
   const checkBody = () => {
     if (req.body && objectHasCRLF(req.body)) {
       const banned = recordViolation(ip);
@@ -274,7 +262,7 @@ function crlfGuard(req, res, next) {
     }
   };
 
-  // Hook into next() flow
+// Hook into next() flow
   const originalNext = next;
   next = function(err) {
     if (err) return originalNext(err);
@@ -282,7 +270,7 @@ function crlfGuard(req, res, next) {
     if (!res.headersSent) originalNext();
   };
 
-  // Log suspicious SQL patterns (non-blocking — for monitoring)
+// Log suspicious SQL patterns (non-blocking — for monitoring)
   const fullReqStr = JSON.stringify({ url: req.url, query: req.query, body: req.body });
   if (SQL_DETECT.test(fullReqStr)) {
     console.warn(`[MINDVORA SECURITY] 🔍 SQL-like pattern detected from IP: ${ip} — ${req.method} ${req.url}`);
@@ -297,10 +285,10 @@ function crlfGuard(req, res, next) {
  */
 function secureErrorHandler(err, req, res, next) {
   const ip = getClientIP(req);
-  // Log full error server-side only
+// Log full error server-side only
   console.error(`[MINDVORA ERROR] ${new Date().toISOString()} | IP: ${ip} | ${req.method} ${req.url}`, err);
 
-  // Send only generic message to client
+// Send only generic message to client
   if (res.headersSent) return next(err);
   
   res.status(err.status || 500).json({
@@ -338,7 +326,7 @@ function unbanIP(ip) {
   console.warn(`[MINDVORA SECURITY] ✅ IP manually unbanned: ${ip}`);
 }
 
-// ── Periodic cleanup of expired entries (every hour) ──────────────────────
+// Periodic cleanup of expired entries (every hour)
 setInterval(() => {
   const now = Date.now();
   for (const [ip, rec] of suspiciousMap.entries()) {

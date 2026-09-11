@@ -1,45 +1,34 @@
-// ╔══════════════════════════════════════════════════════════════════════════╗
-// ║           MINDVORA SECURE BACKEND  —  server.js                         ║
-// ║                                                                          ║
-// ║  Security layers:                                                        ║
-// ║   • CRLF injection defense (auto-ban after 5 strikes)                   ║
-// ║   • Rate limiting (150 req/min per IP, sliding window)                  ║
-// ║   • All security headers (HSTS, CSP, X-Frame, etc.)                     ║
-// ║   • Zero stack-trace leaks in production                                ║
-// ║   • WebSocket server for real-time messaging & WebRTC signaling         ║
-// ║   • Live streaming room management                                       ║
-// ║                                                                          ║
-// ║  Deployment: Railway.com / Render.com                                   ║
-// ╚══════════════════════════════════════════════════════════════════════════╝
-
 'use strict';
 
-// ── Core dependencies ─────────────────────────────────────────────────────
-const http       = require('http');
-const express    = require('express');
-const cors       = require('cors');
+const http        = require('http');
+const express     = require('express');
+const cors        = require('cors');
 const compression = require('compression');
+const crypto      = require('crypto');
 const { WebSocketServer } = require('ws');
-const nodemailer = require('nodemailer');
+const nodemailer  = require('nodemailer');
 
-// ── Local security modules ────────────────────────────────────────────────
 const { crlfGuard, secureErrorHandler, getBanList, unbanIP } = require('./CRLF/defense.evi');
 const { handleConnection, startHeartbeat, getLiveRooms }     = require('./CRLF/ws-server.evi');
+const {
+  rateLimit,
+  verifyRecaptcha,
+  normalizePhoneNG,
+  issueEmailOtp,
+  checkEmailOtp,
+  verifyPaystackRef,
+} = require('./api/_lib/security');
 
-// ── Pre-resolve fetch ONCE at startup (not per-request) ──────────────────
-// Dynamic import on every call added 50-100ms latency per API request.
 let fetch;
 (async () => { fetch = (await import('node-fetch')).default; })();
 
-// ── App setup ─────────────────────────────────────────────────────────────
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ── Remove Express fingerprint immediately ────────────────────────────────
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
 
-// ── CORS — strict allowlist ───────────────────────────────────────────────
+// CORS — strict allowlist
 const ALLOWED_ORIGINS = [
   'https://mindvora.app',
   'https://mindvora-vf8e.vercel.app',
@@ -52,7 +41,7 @@ const ALLOWED_ORIGINS = [
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow requests with no origin (mobile apps, curl, server-to-server)
+// Allow requests with no origin (mobile apps, curl, server-to-server)
     if (!origin || ALLOWED_ORIGINS.includes(origin)) {
       return callback(null, true);
     }
@@ -65,21 +54,24 @@ app.use(cors({
   maxAge: 86400,
 }));
 
-// ── Gzip compression — reduces payload size before sending ───────────────
+// Gzip compression — reduces payload size before sending
 app.use(compression());
 
-// ── ⚔️  CRLF DEFENSE — must be first real middleware ─────────────────────
+// ⚔️  CRLF DEFENSE — must be first real middleware
 app.use(crlfGuard);
 
-// ── Body parsing (after CRLF guard for body sanitization hook) ────────────
+// Body parsing (after CRLF guard for body sanitization hook)
 // 512kb is plenty for any route; 10mb was creating unnecessary large buffers.
 app.use(express.json({ limit: '512kb' }));
 app.use(express.urlencoded({ extended: false, limit: '512kb' }));
 
-// ── Admin secret for sensitive endpoints ──────────────────────────────────
-const ADMIN_SECRET = process.env.ADMIN_SECRET || 'mindvora-admin-change-me';
+// Admin secret for sensitive endpoints
+const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
 
 function requireAdmin(req, res, next) {
+  if (!ADMIN_SECRET) {
+    return res.status(503).json({ error: 'Admin endpoints are not enabled. Set ADMIN_SECRET.', code: 'ADMIN_NOT_CONFIGURED' });
+  }
   const secret = req.headers['x-admin-secret'] || req.query._adm;
   if (secret !== ADMIN_SECRET) {
     return res.status(401).json({ error: 'Unauthorized', code: 'ADMIN_AUTH_FAILED' });
@@ -87,9 +79,7 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ──  HEALTH & WARMUP  ──────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
+// HEALTH & WARMUP
 
 app.get('/', (_req, res) => {
   res.json({ status: 'Mindvora Backend ✅', time: new Date().toISOString() });
@@ -98,9 +88,7 @@ app.get('/', (_req, res) => {
 app.get('/api/crypto/status/ping',   (_req, res) => res.json({ status: 'awake',  time: new Date().toISOString() }));
 app.get('/api/crypto/status/warmup', (_req, res) => res.json({ status: 'warm',   time: new Date().toISOString() }));
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ──  ADMIN ENDPOINTS (protected)  ──────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
+// ADMIN ENDPOINTS (protected)
 
 /** GET /api/admin/bans — list all currently banned IPs */
 app.get('/api/admin/bans', requireAdmin, (_req, res) => {
@@ -118,18 +106,14 @@ app.get('/api/admin/lives', requireAdmin, (_req, res) => {
   res.json({ lives: getLiveRooms() });
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ──  LIVE STREAMING REST API  ──────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
+// LIVE STREAMING REST API
 
 /** GET /api/lives — public list of active streams */
 app.get('/api/lives', (_req, res) => {
   res.json({ lives: getLiveRooms() });
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ──  NOWPAYMENTS — Crypto Invoice  ─────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
+// NOWPAYMENTS — Crypto Invoice
 
 app.post('/api/crypto/create-invoice', async (req, res) => {
   const { amountUSD, description, orderId, userEmail } = req.body;
@@ -170,13 +154,11 @@ app.post('/api/crypto/create-invoice', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ──  NOWPAYMENTS — Check Status  ────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
+// NOWPAYMENTS — Check Status
 
 app.get('/api/crypto/status/:invoiceId', async (req, res) => {
   const { invoiceId } = req.params;
-  // Validate format — prevent injection via param
+// Validate format — prevent injection via param
   if (!/^[\w-]{1,100}$/.test(invoiceId)) {
     return res.status(400).json({ status: false, message: 'Invalid invoice ID.' });
   }
@@ -194,9 +176,7 @@ app.get('/api/crypto/status/:invoiceId', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ──  PAYSTACK — Airtime  ────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
+// PAYSTACK — Airtime
 
 app.post('/api/deliver-airtime', async (req, res) => {
   const { email, amount, phone, network, ref } = req.body;
@@ -225,9 +205,7 @@ app.post('/api/deliver-airtime', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ──  PAYSTACK — Data Bundle  ────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
+// PAYSTACK — Data Bundle
 
 app.post('/api/deliver-data', async (req, res) => {
   const { email, amount, phone, network, bundle, ref } = req.body;
@@ -256,23 +234,19 @@ app.post('/api/deliver-data', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ──  NOWPAYMENTS — IPN Webhook  ─────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
+// NOWPAYMENTS — IPN Webhook
 
 app.post('/api/crypto/webhook', async (req, res) => {
-  // Webhook is server-to-server — log internally only
+// Webhook is server-to-server — log internally only
   const payload = req.body;
   if (payload.payment_status === 'finished' || payload.payment_status === 'confirmed') {
-    // Internal audit log only — never exposed to clients
+// Internal audit log only — never exposed to clients
     console.log(`[WEBHOOK] Crypto payment confirmed | order: ${payload.order_id} | amount: $${payload.price_amount}`);
   }
   res.status(200).send('OK');
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ──  EXCHANGE RATE PROXY  ────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
+// EXCHANGE RATE PROXY
 
 // In-memory rate cache — avoids hammering the external API on every request
 const rateCache = new Map(); // key: 'FROM_TO' → { rate, expiresAt }
@@ -284,7 +258,7 @@ app.get('/api/rate/:from/:to', async (req, res) => {
     return res.status(400).json({ error: 'Invalid currency codes.' });
   }
 
-  // Serve from cache if fresh
+// Serve from cache if fresh
   const cacheKey = `${from}_${to}`;
   const cached   = rateCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
@@ -305,16 +279,41 @@ app.get('/api/rate/:from/:to', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ──  HUSMODATA VTU — Airtime  ────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
+// HUSMODATA VTU — Airtime
 
 const HUSMO_BASE = 'https://husmodata.com/api';
+const HUSMO_MIN_AMOUNT = 50;
+const HUSMO_MAX_AMOUNT = 200000;
+const husmoDelivered = new Set();
 
 app.post('/api/husmo-airtime', async (req, res) => {
+  if (rateLimit(req, 'husmo:airtime', 20, 600000)) {
+    return res.status(429).json({ status: false, message: 'Too many requests. Try again later.' });
+  }
   const { phone, network, amount, ref } = req.body;
-  if (!phone || !network || !amount) {
-    return res.status(400).json({ status: false, message: 'Missing required fields.' });
+  const normalized = normalizePhoneNG(phone);
+  if (!normalized) {
+    return res.status(400).json({ status: false, message: 'Enter a valid Nigerian phone number.' });
+  }
+  if (!/^(mtn|airtel|glo|9mobile|etisalat)$/i.test(String(network || ''))) {
+    return res.status(400).json({ status: false, message: 'Unsupported network.' });
+  }
+  if (!amount || !Number.isInteger(Number(amount)) || Number(amount) < HUSMO_MIN_AMOUNT || Number(amount) > HUSMO_MAX_AMOUNT) {
+    return res.status(400).json({ status: false, message: 'Amount must be between ' + HUSMO_MIN_AMOUNT + ' and ' + HUSMO_MAX_AMOUNT + ' NGN.' });
+  }
+  if (husmoDelivered.size > 5000) husmoDelivered.clear();
+  if (ref && husmoDelivered.has(ref)) {
+    return res.status(409).json({ status: false, message: 'This payment reference was already used.' });
+  }
+  const check = await verifyPaystackRef(ref, Number(amount) * 100);
+  if (!check.configured) {
+    return res.status(500).json({ status: false, message: 'Paystack is not configured yet (PAYSTACK_SECRET_KEY missing).' });
+  }
+  if (!check.ok) {
+    const msg = check.error === 'not_paid' ? 'Payment not completed. Nothing was sent.'
+      : check.error === 'amount_mismatch' ? 'Payment amount does not match. Nothing was sent.'
+      : 'Could not confirm your payment. Try again.';
+    return res.status(402).json({ status: false, message: msg });
   }
   try {
     const response = await fetch(`${HUSMO_BASE}/topup/`, {
@@ -324,8 +323,8 @@ app.post('/api/husmo-airtime', async (req, res) => {
         'Content-Type':  'application/json',
       },
       body: JSON.stringify({
-        mobile_number: phone,
-        network:       network.toUpperCase(),
+        mobile_number: normalized,
+        network:       String(network).toUpperCase(),
         amount,
         Ported_number: true,
         airtime_type:  'VTU',
@@ -333,23 +332,49 @@ app.post('/api/husmo-airtime', async (req, res) => {
     });
     if (!response.ok) return res.status(response.status).json({ status: false, message: 'VTU provider error.' });
     const data = await response.json();
-    res.json(data);
+    if (ref) husmoDelivered.add(ref);
+    res.json({ status: 'success', reference: (data && data.ref) || ref, ...data });
   } catch (_) {
     res.status(500).json({ status: false, message: 'Unable to process airtime. Please try again.' });
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ──  HUSMODATA VTU — Data Bundle  ────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
+// HUSMODATA VTU — Data Bundle
 
 app.post('/api/husmo-data', async (req, res) => {
-  const { phone, network, bundle } = req.body;
-  if (!phone || !network || !bundle) {
-    return res.status(400).json({ status: false, message: 'Missing required fields.' });
+  if (rateLimit(req, 'husmo:data', 20, 600000)) {
+    return res.status(429).json({ status: false, message: 'Too many requests. Try again later.' });
+  }
+  const { phone, network, bundle, amount, ref } = req.body;
+  const normalized = normalizePhoneNG(phone);
+  if (!normalized) {
+    return res.status(400).json({ status: false, message: 'Enter a valid Nigerian phone number.' });
+  }
+  if (!/^(mtn|airtel|glo|9mobile|etisalat)$/i.test(String(network || ''))) {
+    return res.status(400).json({ status: false, message: 'Unsupported network.' });
+  }
+  if (!bundle || typeof bundle !== 'string' || !/^[A-Za-z0-9]{3,12}$/.test(bundle)) {
+    return res.status(400).json({ status: false, message: 'Invalid data bundle.' });
+  }
+  if (!amount || !Number.isInteger(Number(amount)) || Number(amount) < HUSMO_MIN_AMOUNT || Number(amount) > HUSMO_MAX_AMOUNT) {
+    return res.status(400).json({ status: false, message: 'Amount must be between ' + HUSMO_MIN_AMOUNT + ' and ' + HUSMO_MAX_AMOUNT + ' NGN.' });
+  }
+  if (husmoDelivered.size > 5000) husmoDelivered.clear();
+  if (ref && husmoDelivered.has(ref)) {
+    return res.status(409).json({ status: false, message: 'This payment reference was already used.' });
+  }
+  const check = await verifyPaystackRef(ref, Number(amount) * 100);
+  if (!check.configured) {
+    return res.status(500).json({ status: false, message: 'Paystack is not configured yet (PAYSTACK_SECRET_KEY missing).' });
+  }
+  if (!check.ok) {
+    const msg = check.error === 'not_paid' ? 'Payment not completed. Nothing was sent.'
+      : check.error === 'amount_mismatch' ? 'Payment amount does not match. Nothing was sent.'
+      : 'Could not confirm your payment. Try again.';
+    return res.status(402).json({ status: false, message: msg });
   }
   const networkMap = { mtn: 1, airtel: 2, glo: 3, '9mobile': 4, etisalat: 4 };
-  const networkId  = networkMap[network.toLowerCase()] || 1;
+  const networkId  = networkMap[String(network).toLowerCase()] || 1;
   try {
     const response = await fetch(`${HUSMO_BASE}/data/`, {
       method: 'POST',
@@ -359,22 +384,21 @@ app.post('/api/husmo-data', async (req, res) => {
       },
       body: JSON.stringify({
         network:       networkId,
-        mobile_number: phone,
+        mobile_number: normalized,
         plan:          bundle,
         Ported_number: true,
       }),
     });
     if (!response.ok) return res.status(response.status).json({ status: false, message: 'VTU provider error.' });
     const data = await response.json();
-    res.json(data);
+    if (ref) husmoDelivered.add(ref);
+    res.json({ status: 'success', reference: (data && data.ref) || ref, ...data });
   } catch (_) {
     res.status(500).json({ status: false, message: 'Unable to process data bundle. Please try again.' });
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ──  HUSMODATA — Balance  ────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
+// HUSMODATA — Balance
 
 app.get('/api/husmo-balance', requireAdmin, async (_req, res) => {
   try {
@@ -389,17 +413,15 @@ app.get('/api/husmo-balance', requireAdmin, async (_req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ──  NODEMAILER — Email OTP Delivery  ────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
+// NODEMAILER — Email OTP Delivery
 //
 // Configure via environment variables:
-//   SMTP_HOST   e.g. smtp.gmail.com | smtp.zoho.eu | smtp-mail.outlook.com
-//   SMTP_PORT   e.g. 465 (SSL) or 587 (STARTTLS)
-//   SMTP_SECURE "true"/"false"      — true for 465, false for 587
-//   SMTP_USER   the account address that sends the mail
-//   SMTP_PASS   app password / SMTP password for that account
-//   SMTP_FROM   optional sender address (defaults to SMTP_USER)
+// SMTP_HOST   e.g. smtp.gmail.com | smtp.zoho.eu | smtp-mail.outlook.com
+// SMTP_PORT   e.g. 465 (SSL) or 587 (STARTTLS)
+// SMTP_SECURE "true"/"false"      — true for 465, false for 587
+// SMTP_USER   the account address that sends the mail
+// SMTP_PASS   app password / SMTP password for that account
+// SMTP_FROM   optional sender address (defaults to SMTP_USER)
 //
 // Recommended free option: Gmail with an App Password, or Zoho Mail free tier.
 
@@ -425,28 +447,43 @@ function makeTransporter() {
 
 /** POST /api/otp/send-email { email, code } — emails a 6-digit OTP via NodeMailer */
 app.post('/api/otp/send-email', async (req, res) => {
-  const { email, code } = req.body || {};
+  if (rateLimit(req, 'otp:send-email', 10, 60000)) {
+    return res.status(429).json({ status: false, message: 'Too many requests. Try again in a minute.' });
+  }
+  const { email } = req.body || {};
   if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(email))) {
     return res.status(400).json({ status: false, message: 'Invalid email address.' });
   }
-  if (!/^\d{6}$/.test(String(code || ''))) {
-    return res.status(400).json({ status: false, message: 'Invalid code.' });
+  const captcha = await verifyRecaptcha(req);
+  if (!captcha.configured) {
+    return res.status(500).json({ status: false, message: 'reCAPTCHA is not configured yet (RECAPTCHA_SECRET_KEY missing).' });
+  }
+  if (!captcha.ok) {
+    return res.status(403).json({ status: false, message: 'Could not verify you are human. Please try again.' });
   }
   if (!smtpConfigured()) {
     return res.status(500).json({ status: false, message: 'Email service is not configured yet (SMTP env vars missing).' });
   }
+  const normalized = String(email).toLowerCase().trim();
+  const issued = issueEmailOtp(normalized);
+  if (issued.cooldown) {
+    return res.status(429).json({ status: false, message: 'Please wait ' + issued.retryAfter + 's before requesting another code.' });
+  }
+  if (issued.rateLimited) {
+    return res.status(429).json({ status: false, message: 'Too many codes sent to this email. Try again later.' });
+  }
   try {
     const transporter = makeTransporter();
     await transporter.sendMail({
-      from: `Mindvora <${SMTP_FROM}>`,
-      to: email,
+      from: 'Mindvora <' + SMTP_FROM + '>',
+      to: normalized,
       subject: 'Mindvora — Your verification code',
       html:
         '<div style="font-family:Arial,Helvetica,sans-serif;max-width:480px;margin:auto;background:#0d2118;border:1px solid #166534;border-radius:16px;padding:28px">' +
-          '<div style="text-align:center;color:#ffffff;font-size:22px;font-weight:700;margin-bottom:4px">🌿 Mindvora</div>' +
+          '<div style="text-align:center;color:#ffffff;font-size:22px;font-weight:700;margin-bottom:4px">Mindvora</div>' +
           '<div style="text-align:center;color:#00C896;font-size:11px;letter-spacing:2px;margin-bottom:24px">WHERE MINDS CONNECT</div>' +
           '<div style="color:#e2e8f0;font-size:14px;line-height:1.7;margin-bottom:16px">Hello! Your Mindvora verification code is:</div>' +
-          '<div style="text-align:center;font-size:32px;font-weight:700;letter-spacing:10px;color:#00C896;background:#0a1a0f;border:1px solid #166534;border-radius:12px;padding:16px;margin-bottom:16px">' + String(code) + '</div>' +
+          '<div style="text-align:center;font-size:32px;font-weight:700;letter-spacing:10px;color:#00C896;background:#0a1a0f;border:1px solid #166534;border-radius:12px;padding:16px;margin-bottom:16px">' + issued.code + '</div>' +
           '<div style="color:#94a3b8;font-size:12px;line-height:1.6">This code expires in 10 minutes. If you did not request this, you can safely ignore this email.</div>' +
         '</div>',
     });
@@ -457,14 +494,30 @@ app.post('/api/otp/send-email', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ──  TWILIO VERIFY — SMS OTP Delivery & Verification  ───────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
+app.post('/api/otp/verify-email', async (req, res) => {
+  if (rateLimit(req, 'otp:verify-email', 10, 60000)) {
+    return res.status(429).json({ status: false, message: 'Too many requests. Try again in a minute.' });
+  }
+  const { email, code } = req.body || {};
+  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(email))) {
+    return res.status(400).json({ status: false, message: 'Invalid email address.' });
+  }
+  if (!/^\d{6}$/.test(String(code || ''))) {
+    return res.status(400).json({ status: false, message: 'Enter the 6-digit code you received.' });
+  }
+  const result = checkEmailOtp(String(email).toLowerCase().trim(), String(code).trim());
+  if (result.status === 'ok') {
+    return res.json({ status: true, message: 'Email verified.' });
+  }
+  return res.status(400).json({ status: false, message: result.message });
+});
+
+// TWILIO VERIFY — SMS OTP Delivery & Verification
 //
 // Configure via environment variables:
-//   TWILIO_ACCOUNT_SID        your Twilio Account SID
-//   TWILIO_AUTH_TOKEN         your Twilio Auth Token
-//   TWILIO_VERIFY_SERVICE_SID your Verify Service SID (Twilio Console → Verify)
+// TWILIO_ACCOUNT_SID        your Twilio Account SID
+// TWILIO_AUTH_TOKEN         your Twilio Auth Token
+// TWILIO_VERIFY_SERVICE_SID your Verify Service SID (Twilio Console → Verify)
 
 const TWILIO_SID    = process.env.TWILIO_ACCOUNT_SID        || '';
 const TWILIO_TOKEN  = process.env.TWILIO_AUTH_TOKEN         || '';
@@ -480,9 +533,20 @@ function twilioAuth() {
 
 /** POST /api/otp/send-sms { phone } — Twilio sends its own 6-digit code */
 app.post('/api/otp/send-sms', async (req, res) => {
+  if (rateLimit(req, 'otp:send-sms', 10, 60000)) {
+    return res.status(429).json({ status: false, message: 'Too many requests. Try again in a minute.' });
+  }
   const { phone } = req.body || {};
-  if (!phone || typeof phone !== 'string' || phone.trim().length < 7) {
-    return res.status(400).json({ status: false, message: 'Enter a valid phone number.' });
+  const normalized = normalizePhoneNG(phone);
+  if (!normalized) {
+    return res.status(400).json({ status: false, message: 'Enter a valid Nigerian phone number.' });
+  }
+  const captcha = await verifyRecaptcha(req);
+  if (!captcha.configured) {
+    return res.status(500).json({ status: false, message: 'reCAPTCHA is not configured yet (RECAPTCHA_SECRET_KEY missing).' });
+  }
+  if (!captcha.ok) {
+    return res.status(403).json({ status: false, message: 'Could not verify you are human. Please try again.' });
   }
   if (!twilioConfigured()) {
     return res.status(500).json({ status: false, message: 'SMS service is not configured yet (Twilio env vars missing).' });
@@ -494,7 +558,7 @@ app.post('/api/otp/send-sms', async (req, res) => {
         'Authorization': twilioAuth(),
         'Content-Type': 'application/x-www-form-urlencoded',
       },
-      body: new URLSearchParams({ To: phone.trim(), Channel: 'sms' }).toString(),
+      body: new URLSearchParams({ To: normalized, Channel: 'sms' }).toString(),
     });
     const data = await resp.json();
     if (!resp.ok) {
@@ -509,8 +573,12 @@ app.post('/api/otp/send-sms', async (req, res) => {
 
 /** POST /api/otp/verify-sms { phone, code } — confirms code with Twilio */
 app.post('/api/otp/verify-sms', async (req, res) => {
+  if (rateLimit(req, 'otp:verify-sms', 10, 60000)) {
+    return res.status(429).json({ status: false, message: 'Too many requests. Try again in a minute.' });
+  }
   const { phone, code } = req.body || {};
-  if (!phone || !/^\d{4,8}$/.test(String(code || ''))) {
+  const normalized = normalizePhoneNG(phone);
+  if (!normalized || !/^\d{4,8}$/.test(String(code || ''))) {
     return res.status(400).json({ status: false, message: 'Invalid verification details.' });
   }
   if (!twilioConfigured()) {
@@ -523,7 +591,7 @@ app.post('/api/otp/verify-sms', async (req, res) => {
         'Authorization': twilioAuth(),
         'Content-Type': 'application/x-www-form-urlencoded',
       },
-      body: new URLSearchParams({ To: phone.trim(), Code: String(code) }).toString(),
+      body: new URLSearchParams({ To: normalized, Code: String(code) }).toString(),
     });
     const data = await resp.json();
     if (data && data.status === 'approved') {
@@ -535,9 +603,7 @@ app.post('/api/otp/verify-sms', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ──  PAYSTACK — Redirect Checkout (fallback for Popup)  ─────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
+// PAYSTACK — Redirect Checkout (fallback for Popup)
 //
 // Uses PAYSTACK_SECRET_KEY to initialize a transaction and return the hosted
 // authorization_url. Used as a fallback when the inline Popup cannot load.
@@ -578,20 +644,35 @@ app.post('/api/paystack/initialize', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ──  404 CATCH-ALL  ──────────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
+// PAYSTACK — Webhook (signature-verified)
+
+app.post('/api/paystack/webhook', (req, res) => {
+  const secret = process.env.PAYSTACK_SECRET_KEY;
+  const signature = req.headers['x-paystack-signature'];
+  if (!secret) return res.status(500).json({ status: false, message: 'Paystack is not configured yet.' });
+  if (!signature || typeof signature !== 'string') return res.status(400).send('Missing signature');
+  const expected = crypto.createHmac('sha512', secret).update(JSON.stringify(req.body)).digest('hex');
+  if (signature !== expected) {
+    console.warn('[PAYSTACK] Rejected webhook with invalid signature');
+    return res.status(401).send('Invalid signature');
+  }
+  const event = req.body && req.body.event;
+  if (event === 'charge.success') {
+    console.log('[PAYSTACK] Charge success webhook | ref:', req.body.data && req.body.data.reference);
+  }
+  res.status(200).send('OK');
+});
+
+// 404 CATCH-ALL
 
 app.use((_req, res) => {
   res.status(404).json({ error: 'Not found.', code: 'NOT_FOUND' });
 });
 
-// ── Secure error handler (must be LAST) ───────────────────────────────────
+// Secure error handler (must be LAST)
 app.use(secureErrorHandler);
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ──  HTTP + WEBSOCKET SERVER  ────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
+// HTTP + WEBSOCKET SERVER
 
 const server = http.createServer(app);
 
@@ -611,9 +692,9 @@ server.listen(PORT, () => {
   console.log(`🛡️  CRLF Defense System active`);
   console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
 
-  // ── Self-ping every 14 min to prevent Railway cold starts ────────────────
-  // Railway spins down idle free-tier servers after ~15 min of inactivity.
-  // This keeps the server warm so the first real user request is instant.
+// Self-ping every 14 min to prevent Railway cold starts
+// Railway spins down idle free-tier servers after ~15 min of inactivity.
+// This keeps the server warm so the first real user request is instant.
   const SELF_URL = process.env.RAILWAY_STATIC_URL
     ? `https://${process.env.RAILWAY_STATIC_URL}/api/crypto/status/ping`
     : null;
@@ -628,7 +709,7 @@ server.listen(PORT, () => {
   }
 });
 
-// ── Graceful shutdown ─────────────────────────────────────────────────────
+// Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('[MINDVORA] SIGTERM received — shutting down gracefully');
   wss.close(() => {
@@ -641,7 +722,7 @@ process.on('SIGTERM', () => {
 
 process.on('uncaughtException', (err) => {
   console.error('[MINDVORA CRITICAL] Uncaught exception:', err.message);
-  // Don't exit — log and continue
+// Don't exit — log and continue
 });
 
 process.on('unhandledRejection', (reason) => {

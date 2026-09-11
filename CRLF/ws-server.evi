@@ -1,22 +1,16 @@
 /**
- * ╔══════════════════════════════════════════════════════════════════════╗
- * ║        MINDVORA — WEBSOCKET ROOM MANAGER  ·  ws-server.evi          ║
- * ║                                                                      ║
- * ║  Manages real-time rooms for:                                        ║
- * ║   • Live streaming (WebRTC signaling)                                ║
- * ║   • Viewer count broadcasting                                        ║
- * ║   • Follower notifications when a creator goes live                  ║
- * ║   • Secure message parsing (CRLF-safe)                              ║
- * ╚══════════════════════════════════════════════════════════════════════╝
+ * WebSocket room manager: live-streaming rooms (WebRTC signaling),
+ * viewer count broadcasting, and follower notifications when a
+ * creator goes live. Message parsing is CRLF-safe.
  */
 
 'use strict';
 
 const { sanitizeValue, sanitizeDeep } = require('./defense.evi');
 
-// ── Message types ─────────────────────────────────────────────────────────
+// Message types
 const MSG = {
-  // Client → Server
+// Client → Server
   JOIN_ROOM:       'JOIN_ROOM',
   LEAVE_ROOM:      'LEAVE_ROOM',
   SIGNAL:          'SIGNAL',         // WebRTC offer/answer/ICE
@@ -24,7 +18,7 @@ const MSG = {
   LIVE_END:        'LIVE_END',
   PING:            'PING',
 
-  // Server → Client
+// Server → Client
   LIVE_STARTED:    'LIVE_STARTED',
   LIVE_ENDED:      'LIVE_ENDED',
   VIEWER_COUNT:    'VIEWER_COUNT',
@@ -36,16 +30,16 @@ const MSG = {
   ROOM_INFO:       'ROOM_INFO',
 };
 
-// ── Room store: roomId → { hostWs, hostUid, hostName, viewers: Map<uid → ws>, startedAt } ──
+// Room store: roomId → { hostWs, hostUid, hostName, viewers: Map<uid → ws>, startedAt }
 const rooms = new Map();
 
-// ── User→Room index for fast lookup ───────────────────────────────────────
+// User→Room index for fast lookup
 const userRoom = new Map(); // uid → roomId
 
-// ── Global connected clients set ──────────────────────────────────────────
+// Global connected clients set
 const clients = new Set(); // all connected WebSocket clients
 
-// ── Helper: safe JSON send ────────────────────────────────────────────────
+// Helper: safe JSON send
 function safeSend(ws, payload) {
   try {
     if (ws && ws.readyState === 1 /* OPEN */) {
@@ -54,7 +48,7 @@ function safeSend(ws, payload) {
   } catch (_) { /* ignore closed sockets */ }
 }
 
-// ── Helper: broadcast to all viewers in a room ────────────────────────────
+// Helper: broadcast to all viewers in a room
 function broadcastRoom(roomId, payload, excludeWs = null) {
   const room = rooms.get(roomId);
   if (!room) return;
@@ -66,14 +60,14 @@ function broadcastRoom(roomId, payload, excludeWs = null) {
   }
 }
 
-// ── Helper: broadcast to ALL connected clients ────────────────────────────
+// Helper: broadcast to ALL connected clients
 function broadcastGlobal(payload) {
   for (const ws of clients) {
     safeSend(ws, payload);
   }
 }
 
-// ── Helper: send viewer count update to all in room ───────────────────────
+// Helper: send viewer count update to all in room
 function sendViewerCount(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
@@ -85,7 +79,7 @@ function sendViewerCount(roomId) {
   });
 }
 
-// ── Parse and validate incoming message (CRLF-safe) ───────────────────────
+// Parse and validate incoming message (CRLF-safe)
 function parseMessage(rawData) {
   try {
     const str = rawData.toString().replace(/[\r\n\x00]/g, '');
@@ -103,12 +97,12 @@ function parseMessage(rawData) {
 function handleConnection(ws, req) {
   clients.add(ws);
 
-  // Attach metadata
+// Attach metadata
   ws._uid    = null;
   ws._name   = null;
   ws._roomId = null;
 
-  // Heartbeat: close stale connections
+// Heartbeat: close stale connections
   ws._alive  = true;
   ws.on('pong', () => { ws._alive = true; });
 
@@ -121,13 +115,13 @@ function handleConnection(ws, req) {
 
     switch (msg.type) {
 
-      // ── PING / PONG keepalive ───────────────────────────────────────────
+// PING / PONG keepalive
       case MSG.PING: {
         safeSend(ws, { type: MSG.PONG, ts: Date.now() });
         break;
       }
 
-      // ── Creator starts a live stream ────────────────────────────────────
+// Creator starts a live stream
       case MSG.LIVE_START: {
         const uid    = sanitizeValue(msg.uid    || '');
         const name   = sanitizeValue(msg.name   || 'Creator');
@@ -139,7 +133,7 @@ function handleConnection(ws, req) {
           break;
         }
 
-        // Clean up any old room by this user
+// Clean up any old room by this user
         const oldRoom = userRoom.get(uid);
         if (oldRoom) {
           const old = rooms.get(oldRoom);
@@ -163,10 +157,10 @@ function handleConnection(ws, req) {
         ws._roomId = roomId;
         userRoom.set(uid, roomId);
 
-        // Confirm to host
+// Confirm to host
         safeSend(ws, { type: MSG.ROOM_INFO, roomId, message: 'Stream started!' });
 
-        // Broadcast to ALL connected clients (followers watching)
+// Broadcast to ALL connected clients (followers watching)
         broadcastGlobal({
           type:       MSG.LIVE_STARTED,
           roomId,
@@ -180,7 +174,7 @@ function handleConnection(ws, req) {
         break;
       }
 
-      // ── Viewer joins a live room ────────────────────────────────────────
+// Viewer joins a live room
       case MSG.JOIN_ROOM: {
         const roomId = sanitizeValue(msg.roomId || '');
         const uid    = sanitizeValue(msg.uid    || '');
@@ -199,7 +193,7 @@ function handleConnection(ws, req) {
         room.viewers.set(uid, ws);
         userRoom.set(uid, roomId);
 
-        // Notify host that viewer joined
+// Notify host that viewer joined
         safeSend(room.hostWs, {
           type:   MSG.VIEWER_JOINED,
           uid,
@@ -207,14 +201,14 @@ function handleConnection(ws, req) {
           roomId,
         });
 
-        // Update viewer count
+// Update viewer count
         sendViewerCount(roomId);
 
         console.log(`[WS] 👁 Viewer joined | room: ${roomId} | viewer: ${name}`);
         break;
       }
 
-      // ── WebRTC Signaling relay ──────────────────────────────────────────
+// WebRTC Signaling relay
       case MSG.SIGNAL: {
         const roomId  = sanitizeValue(msg.roomId  || ws._roomId || '');
         const fromUid = sanitizeValue(msg.fromUid || ws._uid    || '');
@@ -234,18 +228,18 @@ function handleConnection(ws, req) {
           signal,
         };
 
-        // Route: viewer→host or host→specific viewer
+// Route: viewer→host or host→specific viewer
         if (toUid) {
           const targetWs = room.viewers.get(toUid) || (room.hostUid === toUid ? room.hostWs : null);
           safeSend(targetWs, payload);
         } else {
-          // Broadcast signal to all in room except sender
+// Broadcast signal to all in room except sender
           broadcastRoom(roomId, payload, ws);
         }
         break;
       }
 
-      // ── Creator ends stream ─────────────────────────────────────────────
+// Creator ends stream
       case MSG.LIVE_END: {
         const roomId = sanitizeValue(msg.roomId || ws._roomId || '');
         const room   = rooms.get(roomId);
@@ -266,7 +260,7 @@ function handleConnection(ws, req) {
         break;
       }
 
-      // ── Viewer leaves ───────────────────────────────────────────────────
+// Viewer leaves
       case MSG.LEAVE_ROOM: {
         const roomId = sanitizeValue(msg.roomId || ws._roomId || '');
         const uid    = ws._uid;
@@ -289,7 +283,7 @@ function handleConnection(ws, req) {
   ws.on('close', () => {
     clients.delete(ws);
 
-    // Clean up if host disconnected
+// Clean up if host disconnected
     if (ws._roomId && ws._uid) {
       const room = rooms.get(ws._roomId);
       if (room && room.hostUid === ws._uid) {
@@ -311,7 +305,7 @@ function handleConnection(ws, req) {
   });
 }
 
-// ── Heartbeat interval: ping all clients every 30s, close dead ones ────────
+// Heartbeat interval: ping all clients every 30s, close dead ones
 function startHeartbeat(wss) {
   setInterval(() => {
     wss.clients.forEach((ws) => {
