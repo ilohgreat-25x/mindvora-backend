@@ -35,8 +35,14 @@ const crypto = require('crypto');
 
 // ── Pre-resolve fetch ONCE at startup (not per-request) ──────────────────
 // Dynamic import on every call added 50-100ms latency per API request.
+// FIX: this used to be fire-and-forget, so a request arriving before the
+// import resolved (very plausible right after a Render cold start) got
+// `fetch === undefined`, silently breaking reCAPTCHA/NOWPayments/Paystack
+// calls with an uncaught exception the client never saw a response for.
+// We now block server.listen() on this promise so fetch is guaranteed to
+// be ready before the server accepts its first connection.
 let fetch;
-(async () => { fetch = (await import('node-fetch')).default; })();
+const fetchReady = (async () => { fetch = (await import('node-fetch')).default; })();
 
 // ── App setup ─────────────────────────────────────────────────────────────
 const app  = express();
@@ -540,27 +546,29 @@ startHeartbeat(wss);
 // No-ops gracefully if FIREBASE_SERVICE_ACCOUNT_B64 isn't set yet.
 startReferralIntegrityJob();
 
-server.listen(PORT, () => {
-  console.log(`🚀 Mindvora Backend running on port ${PORT}`);
-  console.log(`🔌 WebSocket server active on /ws`);
-  console.log(`🛡️  CRLF Defense System active`);
-  console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
+fetchReady.then(() => {
+  server.listen(PORT, () => {
+    console.log(`🚀 Mindvora Backend running on port ${PORT}`);
+    console.log(`🔌 WebSocket server active on /ws`);
+    console.log(`🛡️  CRLF Defense System active`);
+    console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
 
-  // ── Self-ping every 14 min to prevent Railway cold starts ────────────────
-  // Railway spins down idle free-tier servers after ~15 min of inactivity.
-  // This keeps the server warm so the first real user request is instant.
-  const SELF_URL = process.env.RAILWAY_STATIC_URL
-    ? `https://${process.env.RAILWAY_STATIC_URL}/api/crypto/status/ping`
-    : null;
+    // ── Self-ping every 14 min to prevent Railway cold starts ────────────────
+    // Railway spins down idle free-tier servers after ~15 min of inactivity.
+    // This keeps the server warm so the first real user request is instant.
+    const SELF_URL = process.env.RAILWAY_STATIC_URL
+      ? `https://${process.env.RAILWAY_STATIC_URL}/api/crypto/status/ping`
+      : null;
 
-  if (SELF_URL && process.env.NODE_ENV === 'production') {
-    setInterval(async () => {
-      try {
-        if (fetch) await fetch(SELF_URL, { method: 'GET' });
-      } catch (_) { /* silent — just a keep-alive ping */ }
-    }, 14 * 60 * 1000); // every 14 minutes
-    console.log(`🏓 Self-ping active → ${SELF_URL}`);
-  }
+    if (SELF_URL && process.env.NODE_ENV === 'production') {
+      setInterval(async () => {
+        try {
+          if (fetch) await fetch(SELF_URL, { method: 'GET' });
+        } catch (_) { /* silent — just a keep-alive ping */ }
+      }, 14 * 60 * 1000); // every 14 minutes
+      console.log(`🏓 Self-ping active → ${SELF_URL}`);
+    }
+  });
 });
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────
