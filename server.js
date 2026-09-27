@@ -409,9 +409,19 @@ app.post('/api/otp/send-email', async (req, res) => {
   if (!captcha.configured) {
     return res.status(500).json({ status: false, message: 'reCAPTCHA is not configured yet (RECAPTCHA_SECRET_KEY missing).' });
   }
+  // TEMPORARY BYPASS: some visitors' browsers (tracking-prevention features,
+  // privacy extensions) block Google's recaptcha script from ever loading,
+  // so grecaptcha never generates a token — through no fault of the
+  // person signing up. Set RECAPTCHA_ENFORCE=false in Render's env vars to
+  // let signups through anyway while that's sorted out. Set it back to
+  // (or just remove it — default is enforced) once resolved.
+  const recaptchaEnforced = process.env.RECAPTCHA_ENFORCE !== 'false';
   if (!captcha.ok) {
-    recordAuthFailure(ip, 'otp-send-email');
-    return res.status(403).json({ status: false, message: 'Could not verify you are human. Please try again.' });
+    if (recaptchaEnforced) {
+      recordAuthFailure(ip, 'otp-send-email');
+      return res.status(403).json({ status: false, message: 'Could not verify you are human. Please try again.' });
+    }
+    console.warn(`[reCAPTCHA] Verification failed but RECAPTCHA_ENFORCE=false — allowing OTP send anyway for ${email}. Re-enable enforcement once the client-side script-loading issue is fixed.`);
   }
   if (!smtpConfigured()) {
     return res.status(500).json({ status: false, message: 'Email service is not configured yet (SMTP env vars missing).' });
