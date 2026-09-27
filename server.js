@@ -424,6 +424,7 @@ app.post('/api/otp/send-email', async (req, res) => {
     console.warn(`[reCAPTCHA] Verification failed but RECAPTCHA_ENFORCE=false — allowing OTP send anyway for ${email}. Re-enable enforcement once the client-side script-loading issue is fixed.`);
   }
   if (!smtpConfigured()) {
+    console.error(`[OTP] SMTP not configured — refusing to send to ${email}. Check SMTP_HOST/PORT/USER/PASS/FROM env vars on Render.`);
     return res.status(500).json({ status: false, message: 'Email service is not configured yet (SMTP env vars missing).' });
   }
 
@@ -452,6 +453,7 @@ app.post('/api/otp/send-email', async (req, res) => {
         '</div>',
     });
     res.json({ status: true, message: 'OTP email sent.' });
+    console.log(`[OTP] Email sent successfully to ${normalized} via ${SMTP_HOST}.`);
   } catch (err) {
     console.error('[OTP] Email send failed:', err.message);
     res.status(500).json({ status: false, message: 'Could not send the email. Please try again.' });
