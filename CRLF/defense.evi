@@ -29,16 +29,22 @@ const RATE_WINDOW_MS    = 60 * 1000;     // 1 minute sliding window
 const RATE_MAX_REQUESTS = 150;           // max requests per window per IP
 
 // ── CRLF pattern: catches raw and percent-encoded forms ───────────────────
+// FIX: global (/g) regexes keep a lastIndex cursor, so reusing them with
+// .test() made detection alternate true/false between calls. Separate
+// non-global TEST patterns from global REPLACE patterns.
 const CRLF_PATTERN = /(\r|\n|%0[dD]|%0[aA]|%00)/g;
+const CRLF_TEST    = /(\r|\n|%0[dD]|%0[aA]|%00)/;
 
 // ── Unicode / null byte injection patterns ────────────────────────────────
 const NULL_BYTE_PATTERN = /\x00/g;
+const NULL_BYTE_TEST    = /\x00/;
 
 // ── Path traversal patterns ───────────────────────────────────────────────
-const PATH_TRAVERSAL = /(\.\.(\/|\\)|%2e%2e(%2f|%5c)|%252e%252e)/gi;
+const PATH_TRAVERSAL      = /(\.\.(\/|\\)|%2e%2e(%2f|%5c)|%252e%252e)/gi;
+const PATH_TRAVERSAL_TEST = /(\.\.(\/|\\)|%2e%2e(%2f|%5c)|%252e%252e)/i;
 
 // ── SQL injection detection — now actively BLOCKED, not just logged ───────
-const SQL_DETECT = /(\bunion\b.*\bselect\b|\bselect\b.*\bfrom\b|\bdrop\b.*\btable\b|\bexec\b\s*\(|\binsert\b.*\binto\b|\bdelete\b.*\bfrom\b|\bor\b\s+['"]?1['"]?\s*=\s*['"]?1|--\s*$|;\s*--|\/\*.*\*\/|\bxp_cmdshell\b)/gi;
+const SQL_DETECT = /(\bunion\b.*\bselect\b|\bselect\b.*\bfrom\b|\bdrop\b.*\btable\b|\bexec\b\s*\(|\binsert\b.*\binto\b|\bdelete\b.*\bfrom\b|\bor\b\s+['"]?1['"]?\s*=\s*['"]?1|--\s*$|;\s*--|\/\*.*\*\/|\bxp_cmdshell\b)/i;
 
 /**
  * ─────────────────────────────────────────────────────────────────────────
@@ -119,7 +125,7 @@ function sanitizeDeep(obj) {
  */
 function hasCRLF(val) {
   if (typeof val !== 'string') return false;
-  return CRLF_PATTERN.test(val) || NULL_BYTE_PATTERN.test(val) || PATH_TRAVERSAL.test(val);
+  return CRLF_TEST.test(val) || NULL_BYTE_TEST.test(val) || PATH_TRAVERSAL_TEST.test(val);
 }
 
 /**
@@ -186,13 +192,21 @@ function isRateLimited(ip) {
  * Extract the real client IP, respecting proxy headers.
  */
 function getClientIP(req) {
-  return (
-    req.headers['cf-connecting-ip'] ||
-    req.headers['x-real-ip'] ||
-    (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
-    req.socket.remoteAddress ||
-    'unknown'
-  );
+  // FIX: client-supplied CF-Connecting-IP / X-Real-IP / X-Forwarded-For[0]
+  // are trivially spoofable, which let anyone bypass rate limits, IP bans
+  // and the OTP brute-force lockout. req.ip honours app.set('trust proxy', 1)
+  // (Render's single proxy hop), so it is the real client address.
+  // Render documents that the FIRST X-Forwarded-For entry is the real client
+  // (Render sets RENDER=true automatically). With 'trust proxy' = 1, req.ip
+  // would be the LAST hop — a shared Render/Cloudflare edge IP — so one bad
+  // actor could lock every user out of OTP. Use the first entry on Render.
+  if (process.env.RENDER || process.env.TRUST_XFF_FIRST === 'true') {
+    const first = String((req && req.headers && req.headers['x-forwarded-for']) || '').split(',')[0].trim();
+    if (first) return first;
+  }
+  if (req && req.ip) return req.ip;
+  if (req && req.socket && req.socket.remoteAddress) return req.socket.remoteAddress;
+  return 'unknown';
 }
 
 // ── Security headers added to every response ──────────────────────────────
@@ -255,13 +269,13 @@ function crlfGuard(req, res, next) {
 
   // 4. Detect CRLF in headers
   const headerString = JSON.stringify(req.headers);
-  const hasCRLFHeaders = CRLF_PATTERN.test(headerString) || NULL_BYTE_PATTERN.test(headerString);
+  const hasCRLFHeaders = CRLF_TEST.test(headerString) || NULL_BYTE_TEST.test(headerString);
 
   // 5. Detect CRLF in query params
   const hasCRLFQuery = objectHasCRLF(req.query);
 
   // 6. Detect CRLF in URL path
-  const hasCRLFPath = CRLF_PATTERN.test(req.url) || PATH_TRAVERSAL.test(req.url);
+  const hasCRLFPath = CRLF_TEST.test(req.url) || PATH_TRAVERSAL_TEST.test(req.url);
 
   if (hasCRLFHeaders || hasCRLFQuery || hasCRLFPath) {
     const banned = recordViolation(ip);
@@ -304,32 +318,10 @@ function crlfGuard(req, res, next) {
     return originalJson(data);
   };
 
-  // 10. Watch for CRLF in body after it's parsed
-  const checkBody = () => {
-    if (req.body && objectHasCRLF(req.body)) {
-      const banned = recordViolation(ip);
-      if (!res.headersSent) {
-        return res.status(banned ? 403 : 400).json({
-          error: banned ? 'Access denied. Your IP has been banned.' : 'Bad request. Invalid data in request body.',
-          code: banned ? 'BODY_CRLF_BAN' : 'BODY_CRLF_ATTEMPT'
-        });
-      }
-    } else if (req.body) {
-      req.body = sanitizeDeep(req.body);
-    }
-  };
-
-  // Hook into next() flow
-  const originalNext = next;
-  next = function(err) {
-    if (err) return originalNext(err);
-    checkBody();
-    if (!res.headersSent) originalNext();
-  };
-
-  // Detect and BLOCK suspicious SQL patterns in URL, query, or body
-  const fullReqStr = JSON.stringify({ url: req.url, query: req.query, body: req.body });
-  if (SQL_DETECT.test(fullReqStr)) {
+  // 10. Detect and BLOCK suspicious SQL patterns in URL / query.
+  // (The body is not parsed yet at this point — see bodyGuard below.)
+  const urlQueryStr = JSON.stringify({ url: req.url, query: req.query });
+  if (SQL_DETECT.test(urlQueryStr)) {
     const banned = recordViolation(ip);
     console.warn(`[MINDVORA SECURITY] 🚨 SQLi pattern BLOCKED from IP: ${ip} — ${req.method} ${req.url}`);
     return res.status(400).json({
@@ -338,6 +330,33 @@ function crlfGuard(req, res, next) {
     });
   }
 
+  next();
+}
+
+/**
+ * FIX: body checks used to live inside crlfGuard, which runs BEFORE
+ * express.json(), so req.body was always undefined and request bodies were
+ * never inspected or sanitized. Mount this AFTER the body parsers.
+ */
+function bodyGuard(req, res, next) {
+  if (!req.body || typeof req.body !== 'object') return next();
+  const ip = getClientIP(req);
+  if (objectHasCRLF(req.body)) {
+    const banned = recordViolation(ip);
+    return res.status(banned ? 403 : 400).json({
+      error: banned ? 'Access denied. Your IP has been banned.' : 'Bad request. Invalid data in request body.',
+      code: banned ? 'BODY_CRLF_BAN' : 'BODY_CRLF_ATTEMPT'
+    });
+  }
+  if (SQL_DETECT.test(JSON.stringify(req.body))) {
+    const banned = recordViolation(ip);
+    console.warn(`[MINDVORA SECURITY] 🚨 SQLi pattern BLOCKED in body from IP: ${ip} — ${req.method} ${req.url}`);
+    return res.status(400).json({
+      error: banned ? 'Access denied. Your IP has been banned.' : 'Bad request. Invalid data in request.',
+      code: banned ? 'SQLI_BAN' : 'SQLI_ATTEMPT'
+    });
+  }
+  req.body = sanitizeDeep(req.body);
   next();
 }
 
@@ -410,6 +429,7 @@ setInterval(() => {
 
 module.exports = {
   crlfGuard,
+  bodyGuard,
   secureErrorHandler,
   getBanList,
   unbanIP,

@@ -100,8 +100,10 @@ function parseMessage(rawData) {
  * Handle a new WebSocket connection.
  * Called once per connection from server.js.
  */
-function handleConnection(ws, req) {
+function handleConnection(ws, req, extra) {
   clients.add(ws);
+  // Low latency: send small signalling packets immediately (no Nagle buffering).
+  try { if (ws._socket && ws._socket.setNoDelay) ws._socket.setNoDelay(true); } catch (_) {}
 
   // Attach metadata
   ws._uid    = null;
@@ -116,6 +118,11 @@ function handleConnection(ws, req) {
     const msg = parseMessage(rawData);
     if (!msg || !msg.type) {
       safeSend(ws, { type: MSG.ERROR, message: 'Invalid message format.' });
+      return;
+    }
+
+    if (extra && extra.handles(msg.type)) {
+      Promise.resolve(extra.handle(ws, msg)).catch((e) => console.error('[WS] extra handler:', e.message));
       return;
     }
 
@@ -288,6 +295,7 @@ function handleConnection(ws, req) {
 
   ws.on('close', () => {
     clients.delete(ws);
+    if (extra && extra.onClose) { try { extra.onClose(ws); } catch (_) {} }
 
     // Clean up if host disconnected
     if (ws._roomId && ws._uid) {

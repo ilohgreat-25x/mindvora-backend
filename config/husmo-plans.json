@@ -1,0 +1,7 @@
+{
+  "_comment": "Fill with YOUR Husmodata plan ids (see GET /api/admin/husmo-plans). Empty = auto-lookup from your account.",
+  "mtn":     { "500MB": "", "1GB": "", "2GB": "", "5GB": "", "10GB": "", "20GB": "", "50GB": "", "Unlimited": "" },
+  "glo":     { "500MB": "", "1GB": "", "2GB": "", "5GB": "", "10GB": "", "20GB": "", "50GB": "", "Unlimited": "" },
+  "airtel":  { "500MB": "", "1GB": "", "2GB": "", "5GB": "", "10GB": "", "20GB": "", "50GB": "", "Unlimited": "" },
+  "9mobile": { "500MB": "", "1GB": "", "2GB": "", "5GB": "", "10GB": "", "20GB": "", "50GB": "", "Unlimited": "" }
+}
