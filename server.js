@@ -708,7 +708,7 @@ app.get('/api/health', (_req, res) => {
     husmodata: husmo.configured(),
     adminSecret: !!process.env.ADMIN_SECRET,
     ariaAI: require('./lib/aria').provider() || false,
-    callsLoginCheck: firebaseAdminConfigured() ? 'firebase-admin' : 'google-rest',
+    callsLoginCheck: firebaseAdminConfigured() ? 'firebase-admin' : (process.env.FIREBASE_WEB_API_KEY ? 'google-rest' : 'NOT-SET (add FIREBASE_WEB_API_KEY)'),
     passwordResetEmail: (firebaseAdminConfigured() && !!mailer.provider()) ? 'brevo' : 'firebase-default',
   });
 });
