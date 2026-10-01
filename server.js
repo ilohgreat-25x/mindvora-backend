@@ -32,7 +32,7 @@ const mailer   = require('./lib/mailer');
 const husmo    = require('./lib/husmo');
 const catalog  = require('./lib/catalog');
 const payments = require('./lib/payments');
-const { requireUser, userFromRequest } = require('./lib/auth-user');
+const { requireUser, userFromRequest, verifyIdTokenAny } = require('./lib/auth-user');
 const { admin: fbAdmin, db: fdb, auth: fauth, firebaseAdminConfigured } = require('./lib/firebase-admin');
 const { verifyRecaptcha }                                 = require('./lib/recaptcha');
 const { startReferralIntegrityJob, runIntegrityCheck }    = require('./lib/referral-integrity');
@@ -483,6 +483,45 @@ const OTP_EMAIL_HTML = (code) =>
 
 const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 
+/** POST /api/auth/password-reset { email, continueUrl }
+ *  Sends the Firebase reset link through Brevo (reliable inbox delivery).
+ *  Needs Firebase Admin; without it answers 503 so the website falls back
+ *  to Firebase's own reset email. Always answers the same for unknown emails. */
+const _resetHits = new Map();
+app.post('/api/auth/password-reset', async (req, res) => {
+  const email = String((req.body && req.body.email) || '').toLowerCase().trim();
+  if (!EMAIL_RE.test(email)) return res.status(400).json({ status: false, code: 'BAD_EMAIL', message: 'Please enter a valid email address.' });
+  const ip = req.ip || 'x'; const now = Date.now();
+  const hits = (_resetHits.get(ip) || []).filter((t) => now - t < 15 * 60 * 1000);
+  if (hits.length >= 5) return res.status(429).json({ status: false, code: 'RATE_LIMIT', message: 'Too many reset requests. Wait 15 minutes and try again.' });
+  hits.push(now); _resetHits.set(ip, hits);
+  if (!firebaseAdminConfigured() || !mailer.provider()) {
+    return res.status(503).json({ status: false, code: 'RESET_NOT_CONFIGURED', message: 'Server reset email not set up; use Firebase fallback.' });
+  }
+  let continueUrl = String((req.body && req.body.continueUrl) || '');
+  if (!/^https:\/\/[a-z0-9.-]+(\/.*)?$/i.test(continueUrl)) continueUrl = process.env.FRONTEND_URL || 'https://mindvora-own8.vercel.app';
+  try {
+    let link;
+    try { link = await fauth().generatePasswordResetLink(email, { url: continueUrl }); }
+    catch (e) {
+      if (e && e.code === 'auth/user-not-found') { console.log('[reset] no account for', email); return res.json({ status: true }); }
+      if (e && /continue|unauthorized|domain/i.test(String(e.code || e.message))) link = await fauth().generatePasswordResetLink(email);
+      else throw e;
+    }
+    await mailer.sendMail({ to: email, subject: 'Reset your Mindvora password',
+      text: 'Tap this link to choose a new Mindvora password: ' + link + '\n\nIf you did not ask for this, ignore this email.',
+      html: '<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:24px;background:#0a1a0f;color:#e2e8f0;border-radius:14px">' +
+        '<h2 style="color:#22c55e;margin-top:0">Reset your password</h2><p>Tap the button to choose a new Mindvora password.</p>' +
+        '<p style="text-align:center;margin:24px 0"><a href="' + link + '" style="background:#22c55e;color:#04110a;padding:12px 22px;border-radius:10px;text-decoration:none;font-weight:700">Choose new password</a></p>' +
+        '<p style="font-size:12px;color:#94a3b8">This link expires in 1 hour. If you did not ask for this, ignore this email.</p></div>' });
+    console.log('[reset] link sent via', mailer.provider(), 'to', email);
+    return res.json({ status: true });
+  } catch (err) {
+    console.error('[reset] failed:', err && (err.code || ''), err && err.message);
+    return res.status(502).json({ status: false, code: 'RESET_FAILED', message: 'Could not send the reset email right now. Please try again.' });
+  }
+});
+
 /** POST /api/otp/send-email { email, recaptcha } */
 app.post('/api/otp/send-email', async (req, res) => {
   const ip = getClientIP(req);
@@ -669,6 +708,8 @@ app.get('/api/health', (_req, res) => {
     husmodata: husmo.configured(),
     adminSecret: !!process.env.ADMIN_SECRET,
     ariaAI: require('./lib/aria').provider() || false,
+    callsLoginCheck: firebaseAdminConfigured() ? 'firebase-admin' : 'google-rest',
+    passwordResetEmail: (firebaseAdminConfigured() && !!mailer.provider()) ? 'brevo' : 'firebase-default',
   });
 });
 
@@ -706,8 +747,8 @@ const wss = new WebSocketServer({ server, path: '/ws', perMessageDeflate: false,
 calls.init({
   verifyToken: async (token) => {
     if (process.env.WS_DEV_AUTH === 'true' && /^dev:/.test(token)) return { uid: token.slice(4) }; // local testing only
-    if (!firebaseAdminConfigured() || !token) return null;
-    try { return await fauth().verifyIdToken(token); } catch (_) { return null; }
+    // Works with OR without Firebase Admin (falls back to Google's token check).
+    return verifyIdTokenAny(token);
   },
   pushToUser: (uid, msg) => push.sendToUser(uid, msg),
   saveNotif: async (toUid, type, text, extra) => {
