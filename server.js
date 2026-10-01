@@ -33,7 +33,7 @@ const husmo    = require('./lib/husmo');
 const catalog  = require('./lib/catalog');
 const payments = require('./lib/payments');
 const { requireUser, userFromRequest, verifyIdTokenAny } = require('./lib/auth-user');
-const { admin: fbAdmin, db: fdb, auth: fauth, firebaseAdminConfigured } = require('./lib/firebase-admin');
+const { admin: fbAdmin, db: fdb, auth: fauth, firebaseAdminConfigured, firebaseAdminError } = require('./lib/firebase-admin');
 const { verifyRecaptcha }                                 = require('./lib/recaptcha');
 const { startReferralIntegrityJob, runIntegrityCheck }    = require('./lib/referral-integrity');
 const crypto = require('crypto');
@@ -138,7 +138,7 @@ app.post('/api/admin/run-referral-check', requireAdmin, async (_req, res) => {
   try {
     const result = await runIntegrityCheck();
     if (!result) {
-      return res.status(500).json({ status: false, message: 'Firebase Admin is not configured yet (FIREBASE_SERVICE_ACCOUNT_B64 missing).' });
+      return res.status(500).json({ status: false, message: 'Firebase Admin is not configured yet (add the Firebase service account on Render).' });
     }
     res.json({ status: true, ...result });
   } catch (err) {
@@ -522,6 +522,9 @@ app.post('/api/auth/password-reset', async (req, res) => {
   }
 });
 
+/** GET /api/recaptcha-config — which reCAPTCHA the website should show (public info only). */
+app.get('/api/recaptcha-config', (_req, res) => res.json(require('./lib/recaptcha').recaptchaPublicConfig()));
+
 /** POST /api/otp/send-email { email, recaptcha } */
 app.post('/api/otp/send-email', async (req, res) => {
   const ip = getClientIP(req);
@@ -691,6 +694,8 @@ app.get('/api/health', (_req, res) => {
     status: 'ok',
     firebaseAdmin: firebaseAdminConfigured(),
     recaptchaSecret: !!process.env.RECAPTCHA_SECRET_KEY,
+    recaptchaVersion: (process.env.RECAPTCHA_V2_SECRET_KEY && process.env.RECAPTCHA_V2_SITE_KEY) ? 'v2-checkbox' : (process.env.RECAPTCHA_V2_SECRET_KEY ? 'v2-SITE-KEY-MISSING' : 'v3-invisible'),
+    firebaseAdminProblem: firebaseAdminConfigured() ? null : (firebaseAdminError() || null),
     recaptchaEnforced: process.env.RECAPTCHA_ENFORCE !== 'false',
     emailProvider: email.provider,
     emailFromSet: !!email.from,
@@ -705,10 +710,11 @@ app.get('/api/health', (_req, res) => {
     creatorShare: Number(process.env.CREATOR_SHARE || 0.9),
     nowpayments: !!process.env.NOWPAYMENTS_API_KEY,
     nowpaymentsIpnSecret: !!process.env.NOWPAYMENTS_IPN_SECRET,
+    paymentsReady: firebaseAdminConfigured(),
     husmodata: husmo.configured(),
     adminSecret: !!process.env.ADMIN_SECRET,
     ariaAI: require('./lib/aria').provider() || false,
-    callsLoginCheck: firebaseAdminConfigured() ? 'firebase-admin' : (process.env.FIREBASE_WEB_API_KEY ? 'google-rest' : 'NOT-SET (add FIREBASE_WEB_API_KEY)'),
+    callsLoginCheck: firebaseAdminConfigured() ? 'firebase-admin' : 'google-public-certs',
     passwordResetEmail: (firebaseAdminConfigured() && !!mailer.provider()) ? 'brevo' : 'firebase-default',
   });
 });
