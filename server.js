@@ -13,6 +13,8 @@
 // ╚══════════════════════════════════════════════════════════════════════════╝
 
 'use strict';
+const envFix = require('./lib/env-fix');   // must run before anything reads settings
+const SERVER_STARTED = new Date().toISOString();
 
 // ── Core dependencies ─────────────────────────────────────────────────────
 const http       = require('http');
@@ -394,7 +396,7 @@ app.get('/api/rtc/ice-servers', async (req, res) => {
   if (!user && firebaseAdminConfigured()) return res.status(401).json({ status: false, code: 'AUTH_REQUIRED', message: 'Please log in again.' });
   const r = await rtc.iceServers();
   res.set('Cache-Control', 'private, max-age=600');
-  res.json({ status: true, iceServers: r.servers, relay: r.source !== 'stun-only' });
+  res.json({ status: true, iceServers: r.servers, relay: r.source !== 'stun-only', relaySource: r.source });
 });
 
 // Values the browser needs that may change between test and live mode.
@@ -692,6 +694,9 @@ app.get('/api/health', (_req, res) => {
   const email = mailer.describe();
   res.json({
     status: 'ok',
+    serverStartedAt: SERVER_STARTED,
+    deployedCommit: (process.env.RENDER_GIT_COMMIT || '').slice(0, 7) || null,
+    codeVersion: 'v8-calls-timer',
     firebaseAdmin: firebaseAdminConfigured(),
     recaptchaSecret: !!process.env.RECAPTCHA_SECRET_KEY,
     recaptchaVersion: (process.env.RECAPTCHA_V2_SECRET_KEY && process.env.RECAPTCHA_V2_SITE_KEY) ? 'v2-checkbox' : (process.env.RECAPTCHA_V2_SECRET_KEY ? 'v2-SITE-KEY-MISSING' : 'v3-invisible'),
@@ -704,7 +709,7 @@ app.get('/api/health', (_req, res) => {
     paystack: !!process.env.PAYSTACK_SECRET_KEY,
     paystackMode: /^sk_test_/.test(process.env.PAYSTACK_SECRET_KEY || '') ? 'test' : (process.env.PAYSTACK_SECRET_KEY ? 'live' : 'not-set'),
     paystackPublicKeySet: !!process.env.PAYSTACK_PUBLIC_KEY,
-    callsTurnRelay: rtc.turnSource(),
+    callsTurnRelay: rtc.turnSource() === 'stun-only' ? 'public-fallback (add METERED_DOMAIN + METERED_API_KEY for reliable calls)' : rtc.turnSource(),
     calls: calls.stats(),
     pushVapidKeySet: !!process.env.FCM_VAPID_KEY,
     creatorShare: Number(process.env.CREATOR_SHARE || 0.9),
@@ -715,6 +720,9 @@ app.get('/api/health', (_req, res) => {
     adminSecret: !!process.env.ADMIN_SECRET,
     ariaAI: require('./lib/aria').provider() || false,
     callsLoginCheck: firebaseAdminConfigured() ? 'firebase-admin' : 'google-public-certs',
+    settingsSeen: envFix.seen(),
+    secretFiles: envFix.secretFileNames(),
+    settingsAutoFixed: envFix.fixes,
     passwordResetEmail: (firebaseAdminConfigured() && !!mailer.provider()) ? 'brevo' : 'firebase-default',
   });
 });
