@@ -40,6 +40,7 @@ const { verifyRecaptcha }                                 = require('./lib/recap
 const { startReferralIntegrityJob, runIntegrityCheck }    = require('./lib/referral-integrity');
 const crypto = require('crypto');
 const calls  = require('./lib/calls');
+const realtime = require('./lib/realtime');
 const push   = require('./lib/push');
 const rtc    = require('./lib/rtc');
 
@@ -413,6 +414,21 @@ app.get('/api/public-config', (_req, res) => {
 
 // Forced-update check used by the web app and the Android/iOS app.
 const APP_VERSION_FILE = require('./config/app-version.json');
+function cmpVer(a, b) {
+  const x = String(a || '0').split('.').map(Number), y = String(b || '0').split('.').map(Number);
+  for (let i = 0; i < 3; i++) { const d = (x[i] || 0) - (y[i] || 0); if (d) return d > 0 ? 1 : -1; }
+  return 0;
+}
+function featuresFor(platform, version) {
+  const out = {};
+  Object.entries(APP_VERSION_FILE.features || {}).forEach(([name, f]) => {
+    if (!f || f.enabled !== true) return;                                   // owner flips this when ready
+    if (Array.isArray(f.platforms) && !f.platforms.includes(platform)) return;
+    if (f.minVersion && cmpVer(version || '0.0.0', f.minVersion) < 0) return; // older app: hidden until updated
+    out[name] = true;
+  });
+  return out;
+}
 app.get('/api/app/version', (req, res) => {
   const platform = ['android', 'ios', 'web'].includes(req.query.platform) ? req.query.platform : 'web';
   const base = APP_VERSION_FILE[platform] || {};
@@ -425,6 +441,7 @@ app.get('/api/app/version', (req, res) => {
     minOs: env('MIN_OS') || base.minOs || null,
     storeUrl: env('STORE_URL') || base.storeUrl || null,
     message: base.message || 'A new version of Mindvora is available.',
+    features: featuresFor(platform, String(req.query.version || '')),
   });
 });
 
@@ -696,7 +713,7 @@ app.get('/api/health', (_req, res) => {
     status: 'ok',
     serverStartedAt: SERVER_STARTED,
     deployedCommit: (process.env.RENDER_GIT_COMMIT || '').slice(0, 7) || null,
-    codeVersion: 'v12-video-hd-push',
+    codeVersion: 'v13-realtime',
     firebaseAdmin: firebaseAdminConfigured(),
     recaptchaSecret: !!process.env.RECAPTCHA_SECRET_KEY,
     recaptchaVersion: (process.env.RECAPTCHA_V2_SECRET_KEY && process.env.RECAPTCHA_V2_SITE_KEY) ? 'v2-checkbox' : (process.env.RECAPTCHA_V2_SECRET_KEY ? 'v2-SITE-KEY-MISSING' : 'v3-invisible'),
@@ -772,8 +789,9 @@ calls.init({
   },
 });
 const WS_EXTRA = {
-  handles: (t) => t === 'AUTH' || /^CALL_/.test(t),
-  handle: (ws, msg) => calls.handleMessage(ws, msg),
+  // One socket for everything: login, calls, messages, typing, presence, live notifications.
+  handles: (t) => t === 'AUTH' || /^CALL_/.test(t) || /^RT_/.test(t),
+  handle: (ws, msg) => (/^RT_/.test(msg.type) ? realtime.handle(ws, msg) : calls.handleMessage(ws, msg)),
   onClose: (ws) => calls.onClose(ws),
 };
 
@@ -789,6 +807,7 @@ startHeartbeat(wss);
 startReferralIntegrityJob();
 
 // Turn new notification documents into phone/desktop push notifications.
+push.onNotification((uid, payload) => realtime.emit(uid, payload));
 push.startNotificationWatcher();
 
 fetchReady.then(() => {

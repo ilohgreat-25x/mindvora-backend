@@ -1,7 +1,58 @@
 {
-  "_help": "Raise minSupported to force everyone below it to update. Versions are major.minor.patch. minOs: Android API level / iOS version your newest store build needs (informational — the store enforces it).",
-  "web":     { "latest": "3.0.0", "minSupported": "3.0.0" },
-  "android": { "latest": "3.0.0", "minSupported": "3.0.0", "minOs": "API 24 (Android 7.0)", "storeUrl": "https://play.google.com/store/apps/details?id=app.mindvora.social" },
-  "ios":     { "latest": "3.0.0", "minSupported": "3.0.0", "minOs": "iOS 15.0", "storeUrl": "" },
-  "message": "A new version of Mindvora is available."
+  "_help": "Raise minSupported to force everyone below it to update. Versions are major.minor.patch. minOs: Android API level / iOS version your newest store build needs (informational \u2014 the store enforces it).",
+  "web": {
+    "latest": "3.0.0",
+    "minSupported": "3.0.0"
+  },
+  "android": {
+    "latest": "3.0.0",
+    "minSupported": "3.0.0",
+    "minOs": "API 24 (Android 7.0)",
+    "storeUrl": "https://play.google.com/store/apps/details?id=app.mindvora.social"
+  },
+  "ios": {
+    "latest": "3.0.0",
+    "minSupported": "3.0.0",
+    "minOs": "iOS 15.0",
+    "storeUrl": ""
+  },
+  "message": "A new version of Mindvora is available.",
+  "_features_help": "Hidden features. A feature shows only when enabled=true AND the user's app version >= minVersion. Release flow: ship the build with the feature code -> raise android.latest (soft prompt) or minSupported (forced) -> set enabled=true.",
+  "features": {
+    "q1_mind_moments": {
+      "minVersion": "3.1.0",
+      "enabled": false,
+      "platforms": [
+        "android",
+        "ios",
+        "web"
+      ]
+    },
+    "q2_vora_rooms": {
+      "minVersion": "3.2.0",
+      "enabled": false,
+      "platforms": [
+        "android",
+        "ios",
+        "web"
+      ]
+    },
+    "q3_creator_hub": {
+      "minVersion": "3.3.0",
+      "enabled": false,
+      "platforms": [
+        "android",
+        "ios",
+        "web"
+      ]
+    },
+    "q4_platform_upgrade": {
+      "minVersion": "4.0.0",
+      "enabled": false,
+      "platforms": [
+        "android",
+        "ios"
+      ]
+    }
+  }
 }
