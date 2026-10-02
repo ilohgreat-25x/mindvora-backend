@@ -696,7 +696,7 @@ app.get('/api/health', (_req, res) => {
     status: 'ok',
     serverStartedAt: SERVER_STARTED,
     deployedCommit: (process.env.RENDER_GIT_COMMIT || '').slice(0, 7) || null,
-    codeVersion: 'v11-call-ringtones',
+    codeVersion: 'v12-video-hd-push',
     firebaseAdmin: firebaseAdminConfigured(),
     recaptchaSecret: !!process.env.RECAPTCHA_SECRET_KEY,
     recaptchaVersion: (process.env.RECAPTCHA_V2_SECRET_KEY && process.env.RECAPTCHA_V2_SITE_KEY) ? 'v2-checkbox' : (process.env.RECAPTCHA_V2_SECRET_KEY ? 'v2-SITE-KEY-MISSING' : 'v3-invisible'),
