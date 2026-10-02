@@ -63,3 +63,8 @@ Required: FIREBASE_SERVICE_ACCOUNT_B64, ADMIN_SECRET, RECAPTCHA_SECRET_KEY, BREV
 PAYSTACK_SECRET_KEY, NOWPAYMENTS_API_KEY, NOWPAYMENTS_IPN_SECRET, HUSMODATA_API_KEY
 Optional: HUSMO_PLAN_MAP, EMAIL_FROM_NAME, RESEND_API_KEY, NGN_PER_USD (default 1600 — must match script.js),
 CREATOR_SHARE (0.9), RECAPTCHA_MIN_SCORE (0.5), RECAPTCHA_ENFORCE, EXTRA_ORIGINS, IPN_URL, APP_URL
+
+## Round 6 — calls & push
+1. Calls hung up with "answer failed": CRLF/ws-server.evi ran sanitizeDeep on every WebSocket message, which stripped the line breaks out of the WebRTC offer/answer (SDP). The other phone could not read it. CALL_SIGNAL data is now relayed untouched.
+2. Call notifications never arrived: the call push carried a data key named `from`, which FCM reserves, so Google rejected it. Renamed to `fromUid`; reserved keys are now filtered out.
+3. lib/push.js treated `messaging/invalid-argument` as a dead token and deleted it, so after the first failed call push the user had no tokens and got NO notifications at all. Removed; push failures are now logged.

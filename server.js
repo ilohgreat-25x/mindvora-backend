@@ -13,6 +13,8 @@
 // ╚══════════════════════════════════════════════════════════════════════════╝
 
 'use strict';
+const envFix = require('./lib/env-fix');   // must run before anything reads settings
+const SERVER_STARTED = new Date().toISOString();
 
 // ── Core dependencies ─────────────────────────────────────────────────────
 const http       = require('http');
@@ -33,7 +35,7 @@ const husmo    = require('./lib/husmo');
 const catalog  = require('./lib/catalog');
 const payments = require('./lib/payments');
 const { requireUser, userFromRequest, verifyIdTokenAny } = require('./lib/auth-user');
-const { admin: fbAdmin, db: fdb, auth: fauth, firebaseAdminConfigured } = require('./lib/firebase-admin');
+const { admin: fbAdmin, db: fdb, auth: fauth, firebaseAdminConfigured, firebaseAdminError } = require('./lib/firebase-admin');
 const { verifyRecaptcha }                                 = require('./lib/recaptcha');
 const { startReferralIntegrityJob, runIntegrityCheck }    = require('./lib/referral-integrity');
 const crypto = require('crypto');
@@ -138,7 +140,7 @@ app.post('/api/admin/run-referral-check', requireAdmin, async (_req, res) => {
   try {
     const result = await runIntegrityCheck();
     if (!result) {
-      return res.status(500).json({ status: false, message: 'Firebase Admin is not configured yet (FIREBASE_SERVICE_ACCOUNT_B64 missing).' });
+      return res.status(500).json({ status: false, message: 'Firebase Admin is not configured yet (add the Firebase service account on Render).' });
     }
     res.json({ status: true, ...result });
   } catch (err) {
@@ -394,7 +396,7 @@ app.get('/api/rtc/ice-servers', async (req, res) => {
   if (!user && firebaseAdminConfigured()) return res.status(401).json({ status: false, code: 'AUTH_REQUIRED', message: 'Please log in again.' });
   const r = await rtc.iceServers();
   res.set('Cache-Control', 'private, max-age=600');
-  res.json({ status: true, iceServers: r.servers, relay: r.source !== 'stun-only' });
+  res.json({ status: true, iceServers: r.servers, relay: r.source !== 'stun-only', relaySource: r.source });
 });
 
 // Values the browser needs that may change between test and live mode.
@@ -521,6 +523,9 @@ app.post('/api/auth/password-reset', async (req, res) => {
     return res.status(502).json({ status: false, code: 'RESET_FAILED', message: 'Could not send the reset email right now. Please try again.' });
   }
 });
+
+/** GET /api/recaptcha-config — which reCAPTCHA the website should show (public info only). */
+app.get('/api/recaptcha-config', (_req, res) => res.json(require('./lib/recaptcha').recaptchaPublicConfig()));
 
 /** POST /api/otp/send-email { email, recaptcha } */
 app.post('/api/otp/send-email', async (req, res) => {
@@ -689,8 +694,13 @@ app.get('/api/health', (_req, res) => {
   const email = mailer.describe();
   res.json({
     status: 'ok',
+    serverStartedAt: SERVER_STARTED,
+    deployedCommit: (process.env.RENDER_GIT_COMMIT || '').slice(0, 7) || null,
+    codeVersion: 'v10-calls-sdp-push',
     firebaseAdmin: firebaseAdminConfigured(),
     recaptchaSecret: !!process.env.RECAPTCHA_SECRET_KEY,
+    recaptchaVersion: (process.env.RECAPTCHA_V2_SECRET_KEY && process.env.RECAPTCHA_V2_SITE_KEY) ? 'v2-checkbox' : (process.env.RECAPTCHA_V2_SECRET_KEY ? 'v2-SITE-KEY-MISSING' : 'v3-invisible'),
+    firebaseAdminProblem: firebaseAdminConfigured() ? null : (firebaseAdminError() || null),
     recaptchaEnforced: process.env.RECAPTCHA_ENFORCE !== 'false',
     emailProvider: email.provider,
     emailFromSet: !!email.from,
@@ -699,16 +709,20 @@ app.get('/api/health', (_req, res) => {
     paystack: !!process.env.PAYSTACK_SECRET_KEY,
     paystackMode: /^sk_test_/.test(process.env.PAYSTACK_SECRET_KEY || '') ? 'test' : (process.env.PAYSTACK_SECRET_KEY ? 'live' : 'not-set'),
     paystackPublicKeySet: !!process.env.PAYSTACK_PUBLIC_KEY,
-    callsTurnRelay: rtc.turnSource(),
+    callsTurnRelay: rtc.turnSource() === 'stun-only' ? 'public-fallback (add METERED_DOMAIN + METERED_API_KEY for reliable calls)' : rtc.turnSource(),
     calls: calls.stats(),
     pushVapidKeySet: !!process.env.FCM_VAPID_KEY,
     creatorShare: Number(process.env.CREATOR_SHARE || 0.9),
     nowpayments: !!process.env.NOWPAYMENTS_API_KEY,
     nowpaymentsIpnSecret: !!process.env.NOWPAYMENTS_IPN_SECRET,
+    paymentsReady: firebaseAdminConfigured(),
     husmodata: husmo.configured(),
     adminSecret: !!process.env.ADMIN_SECRET,
     ariaAI: require('./lib/aria').provider() || false,
-    callsLoginCheck: firebaseAdminConfigured() ? 'firebase-admin' : (process.env.FIREBASE_WEB_API_KEY ? 'google-rest' : 'NOT-SET (add FIREBASE_WEB_API_KEY)'),
+    callsLoginCheck: firebaseAdminConfigured() ? 'firebase-admin' : 'google-public-certs',
+    settingsSeen: envFix.seen(),
+    secretFiles: envFix.secretFileNames(),
+    settingsAutoFixed: envFix.fixes,
     passwordResetEmail: (firebaseAdminConfigured() && !!mailer.provider()) ? 'brevo' : 'firebase-default',
   });
 });

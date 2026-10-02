@@ -90,7 +90,14 @@ function parseMessage(rawData) {
   try {
     const str = rawData.toString().replace(/[\r\n\x00]/g, '');
     const parsed = JSON.parse(str);
-    return sanitizeDeep(parsed);
+    const clean = sanitizeDeep(parsed);
+    // FIX (calls): a call's offer/answer (SDP) is a multi-line text — WebRTC REQUIRES its
+    // line breaks. sanitizeDeep removed them, so the receiving phone got one long broken
+    // line and setRemoteDescription failed → "Call could not connect (answer failed)".
+    // The call payload is only relayed to the other phone (never used in headers/HTML),
+    // so it is passed through untouched. Everything else is still sanitized.
+    if (clean && parsed && parsed.type === 'CALL_SIGNAL' && parsed.data !== undefined) clean.data = parsed.data;
+    return clean;
   } catch (_) {
     return null;
   }
