@@ -97,6 +97,8 @@ function parseMessage(rawData) {
     // The call payload is only relayed to the other phone (never used in headers/HTML),
     // so it is passed through untouched. Everything else is still sanitized.
     if (clean && parsed && parsed.type === 'CALL_SIGNAL' && parsed.data !== undefined) clean.data = parsed.data;
+    // Same for Aria questions: code needs its line breaks; the text only goes to the AI model (lib/aria.js limits it).
+    if (clean && parsed && parsed.type === 'RT_ARIA' && Array.isArray(parsed.messages)) clean.messages = parsed.messages;
     return clean;
   } catch (_) {
     return null;

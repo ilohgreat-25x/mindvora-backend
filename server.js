@@ -110,7 +110,11 @@ app.use(express.json({ limit: '512kb', verify: (req, _res, buf) => { req.rawBody
 app.use(express.urlencoded({ extended: false, limit: '512kb' }));
 // FIX: body CRLF/SQLi checks must run AFTER parsing (they never ran before).
 const WEBHOOK_PATHS = new Set(['/api/crypto/webhook', '/api/paystack/webhook']);
-app.use((req, res, next) => (WEBHOOK_PATHS.has(req.path) ? next() : bodyGuard(req, res, next)));
+// Aria's chat text (code, SQL examples, HTML) is only ever sent to the AI model — never into headers, HTML or the
+// database — so the SQL/CRLF body filter must not reject it or count it as a ban strike. lib/aria.js caps its size,
+// validates roles and rate-limits it.
+const GUARD_EXEMPT = new Set(['/api/aria/chat']);
+app.use((req, res, next) => ((WEBHOOK_PATHS.has(req.path) || GUARD_EXEMPT.has(req.path)) ? next() : bodyGuard(req, res, next)));
 
 // ── Admin secret for sensitive endpoints ──────────────────────────────────
 // FIX: the old fallback 'mindvora-admin-change-me' meant anyone could run the
