@@ -109,6 +109,14 @@ function parseMessage(rawData) {
  * Handle a new WebSocket connection.
  * Called once per connection from server.js.
  */
+/** Verified uid for live rooms: the Firebase-authenticated uid on this socket (set by AUTH in lib/calls.js).
+ *  LIVE_ALLOW_UNAUTHED=true restores the old trust-the-client behaviour for local testing only. */
+function liveUid(ws, claimed) {
+  if (ws._authUid) return ws._authUid;
+  if (process.env.LIVE_ALLOW_UNAUTHED === 'true') return sanitizeValue(claimed || '');
+  return '';
+}
+
 function handleConnection(ws, req, extra) {
   clients.add(ws);
   // Low latency: send small signalling packets immediately (no Nagle buffering).
@@ -145,7 +153,10 @@ function handleConnection(ws, req, extra) {
 
       // ── Creator starts a live stream ────────────────────────────────────
       case MSG.LIVE_START: {
-        const uid    = sanitizeValue(msg.uid    || '');
+        // SECURITY: the host identity comes from the socket's verified Firebase login (AUTH), never from
+        // the message — before, anyone could send LIVE_START with another user's uid and broadcast as them.
+        const uid    = liveUid(ws, msg.uid);
+        if (!uid) { safeSend(ws, { type: MSG.ERROR, code: 'NOT_AUTHED', message: 'Signing you in… try Go Live again in a second.' }); break; }
         const name   = sanitizeValue(msg.name   || 'Creator');
         const avatar = sanitizeValue(msg.avatar || '');
         const roomId = `live_${uid}_${Date.now()}`;
@@ -199,8 +210,9 @@ function handleConnection(ws, req, extra) {
       // ── Viewer joins a live room ────────────────────────────────────────
       case MSG.JOIN_ROOM: {
         const roomId = sanitizeValue(msg.roomId || '');
-        const uid    = sanitizeValue(msg.uid    || '');
+        const uid    = liveUid(ws, msg.uid);
         const name   = sanitizeValue(msg.name   || 'Viewer');
+        if (!uid) { safeSend(ws, { type: MSG.ERROR, code: 'NOT_AUTHED', message: 'Signing you in… try again in a second.' }); break; }
 
         const room = rooms.get(roomId);
         if (!room) {
@@ -233,7 +245,9 @@ function handleConnection(ws, req, extra) {
       // ── WebRTC Signaling relay ──────────────────────────────────────────
       case MSG.SIGNAL: {
         const roomId  = sanitizeValue(msg.roomId  || ws._roomId || '');
-        const fromUid = sanitizeValue(msg.fromUid || ws._uid    || '');
+        // SECURITY: the sender is whoever this socket joined/started the room as — not a claimed fromUid.
+        const fromUid = ws._uid || '';
+        if (!fromUid || (ws._roomId && roomId !== ws._roomId)) break;
         const toUid   = sanitizeValue(msg.toUid   || '');
         const signal  = msg.signal; // offer/answer/ICE candidate — don't sanitize (binary-safe)
 
