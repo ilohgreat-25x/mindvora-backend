@@ -10,3 +10,6 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      # Set the value in the Render dashboard (Environment), never in this file.
+      - key: FOOTBALL_DATA_API_KEY
+        sync: false

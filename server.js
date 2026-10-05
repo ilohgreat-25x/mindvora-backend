@@ -710,6 +710,8 @@ app.post('/api/paystack/webhook', async (req, res) => {
 // Public: only true/false flags, no secrets. Open it in a browser to see what is missing.
 require('./lib/aria').mount(app, { userFromRequest });
 require('./lib/live-content').mount(app);
+// Live football (football-data.org, key only in FOOTBALL_DATA_API_KEY) + anime movie catalogue (AniList/Jikan, official links only).
+require('./lib/sports-anime').mount(app);
 
 app.get('/api/health', (_req, res) => {
   const email = mailer.describe();
