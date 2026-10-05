@@ -810,6 +810,9 @@ startHeartbeat(wss);
 // No-ops gracefully if FIREBASE_SERVICE_ACCOUNT_B64 isn't set yet.
 startReferralIntegrityJob();
 
+// Delete stories (and their photos) once their 48 h are up.
+require('./lib/story-cleanup').start();
+
 // Turn new notification documents into phone/desktop push notifications.
 push.onNotification((uid, payload) => realtime.emit(uid, payload));
 push.startNotificationWatcher();
