@@ -818,6 +818,7 @@ require('./lib/story-cleanup').start();
 // Turn new notification documents into phone/desktop push notifications.
 push.onNotification((uid, payload) => realtime.emit(uid, payload));
 push.startNotificationWatcher();
+require('./lib/live-notify').start({ push, emit: (uid, m) => realtime.emit(uid, m) });   // Go Live → every user (WS + push)
 
 fetchReady.then(() => {
   server.listen(PORT, () => {
