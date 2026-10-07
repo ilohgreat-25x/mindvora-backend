@@ -201,7 +201,7 @@ app.post('/api/crypto/create-invoice', requireUser, async (req, res) => {
   // FIX: the price is now computed on the server from { purpose, params } —
   // the browser can no longer decide how much it pays or what it unlocks.
   const { purpose, params } = req.body || {};
-  const priced = catalog.priceOrder(purpose, params, req.user.uid);
+  const priced = await payments.priceAny(purpose, params, req.user.uid);
   if (!priced.ok) return res.status(400).json({ status: false, message: priced.message });
   if (!process.env.NOWPAYMENTS_API_KEY) {
     return res.status(503).json({ status: false, message: 'Crypto payments are not configured (NOWPAYMENTS_API_KEY missing).' });
@@ -651,7 +651,7 @@ app.post('/api/paystack/initialize', requireUser, async (req, res) => {
   const { purpose, params, callbackUrl } = req.body || {};
   const secret = process.env.PAYSTACK_SECRET_KEY;
   if (!secret) return res.status(503).json({ status: false, message: 'Paystack is not configured yet (PAYSTACK_SECRET_KEY missing).' });
-  const priced = catalog.priceOrder(purpose, params, req.user.uid);
+  const priced = await payments.priceAny(purpose, params, req.user.uid);
   if (!priced.ok) return res.status(400).json({ status: false, message: priced.message });
   try {
     const resp = await fetch('https://api.paystack.co/transaction/initialize', {
@@ -713,6 +713,7 @@ require('./lib/live-content').mount(app);
 require('./lib/ads').mount(app, { requireUser, push, emit: (uid, m) => realtime.emit(uid, m) });   // ads: verified payments, unique views, moderation, auto-refund
 // Live football (football-data.org, key only in FOOTBALL_DATA_API_KEY) + anime movie catalogue (AniList/Jikan, official links only).
 require('./lib/sports-anime').mount(app);
+require('./lib/events').mount(app, { requireUser, push, emit: (uid, m) => realtime.emit(uid, m) });   // Paid Events: tickets, capacity, 20% fee
 
 app.get('/api/health', (_req, res) => {
   const email = mailer.describe();
