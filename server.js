@@ -43,6 +43,7 @@ const calls  = require('./lib/calls');
 const realtime = require('./lib/realtime');
 const push   = require('./lib/push');
 const rtc    = require('./lib/rtc');
+const mediaQuota = require('./lib/media-quota');
 
 // ── Pre-resolve fetch ONCE at startup (not per-request) ──────────────────
 // Dynamic import on every call added 50-100ms latency per API request.
@@ -391,6 +392,19 @@ app.get('/api/admin/husmo-plans', requireAdmin, async (_req, res) => {
 });
 
 
+// ── Per-user Cloudinary media quota (all quota state is server-controlled) ──
+app.get('/api/media/quota', requireUser, async (req, res) => {
+  try { res.json({ status: true, quota: await mediaQuota.getQuota(req.user.uid) }); }
+  catch (e) { res.status(e.code === 'FIREBASE_ADMIN_NOT_CONFIGURED' ? 503 : 500).json({ status: false, code: e.code || 'MEDIA_QUOTA_ERROR', message: e.message }); }
+});
+app.post('/api/media/authorize', requireUser, async (req, res) => {
+  try { const out = await mediaQuota.authorize({ uid: req.user.uid, bytes: req.body && req.body.bytes, resourceType: req.body && req.body.resourceType, fileName: req.body && req.body.fileName }); res.json({ status: true, ...out }); }
+  catch (e) { const status = e.code === 'CLOUDINARY_NOT_CONFIGURED' || e.code === 'FIREBASE_ADMIN_NOT_CONFIGURED' ? 503 : (e.code === 'MEDIA_QUOTA_EXCEEDED' || e.code === 'DAILY_MEDIA_LIMIT' || e.code === 'MEDIA_FILE_TOO_LARGE' ? 413 : 400); res.status(status).json({ status: false, code: e.code || 'MEDIA_AUTHORIZE_FAILED', message: e.message }); }
+});
+app.post('/api/media/reservations/:id/release', requireUser, async (req, res) => { try { res.json({ status: true, result: await mediaQuota.release(req.user.uid, req.params.id, req.body && req.body.publicId, req.body && req.body.resourceType) }); } catch (e) { res.status(e.code === 'FORBIDDEN' ? 403 : 400).json({ status: false, code: e.code || 'MEDIA_RELEASE_FAILED', message: e.message }); } });
+app.post('/api/media/reservations/:id/finalize', requireUser, async (req, res) => { try { res.json({ status: true, result: await mediaQuota.finalize(req.user.uid, req.params.id, req.body && req.body.bytes, req.body && req.body.publicId, req.body && req.body.resourceType) }); } catch (e) { res.status(e.code === 'FORBIDDEN' ? 403 : 400).json({ status: false, code: e.code || 'MEDIA_FINALIZE_FAILED', message: e.message }); } });
+app.post('/api/media/assets/delete', requireUser, async (req, res) => { try { res.json({ status: true, result: await mediaQuota.deleteOwnedAsset(req.user.uid, req.body && req.body.publicId, req.body && req.body.resourceType) }); } catch (e) { res.status(e.code === 'FORBIDDEN' ? 403 : 400).json({ status: false, code: e.code || 'MEDIA_DELETE_FAILED', message: e.message }); } });
+app.get('/api/admin/media-quota/status', requireAdmin, async (_req, res) => { res.json({ status: true, configured: mediaQuota.cloudinaryConfigured(), config: mediaQuota.config(), cleanup: 'interval-active' }); });
 // ═══════════════════════════════════════════════════════════════════════════
 // ──  CALLS, PUSH, APP VERSION, PUBLIC CONFIG  ─────────────────────────────
 // ═══════════════════════════════════════════════════════════════════════════
@@ -818,6 +832,7 @@ startReferralIntegrityJob();
 
 // Delete stories (and their photos) once their 48 h are up.
 require('./lib/story-cleanup').start();
+mediaQuota.startCleanup();
 
 // Turn new notification documents into phone/desktop push notifications.
 push.onNotification((uid, payload) => realtime.emit(uid, payload));
