@@ -711,6 +711,7 @@ app.post('/api/paystack/webhook', async (req, res) => {
 require('./lib/aria').mount(app, { userFromRequest });
 require('./lib/live-content').mount(app);
 require('./lib/live-news').mount(app);   // Stream Live News: 10 official 24/7 news channels (8 international, 2 Nigerian)
+require('./lib/official-video-sources').mount(app); // Sports-only official YouTube live sources; news remains separate above
 require('./lib/referral-switch').mount(app, { requireUser });   // owner's referral ON/OFF switch + notify every user on ON
 require('./lib/ads').mount(app, { requireUser, push, emit: (uid, m) => realtime.emit(uid, m) });   // ads: verified payments, unique views, moderation, auto-refund
 // Live football (football-data.org, key only in FOOTBALL_DATA_API_KEY) + anime movie catalogue (AniList/Jikan, official links only).
