@@ -394,11 +394,11 @@ app.get('/api/admin/husmo-plans', requireAdmin, async (_req, res) => {
 
 // ── Per-user Cloudinary media quota (all quota state is server-controlled) ──
 app.get('/api/media/quota', requireUser, async (req, res) => {
-  try { res.json({ status: true, quota: await mediaQuota.getQuota(req.user.uid) }); }
+  try { res.json({ status: true, quota: await mediaQuota.getQuota(req.user.uid, req.user.email) }); }
   catch (e) { res.status(e.code === 'FIREBASE_ADMIN_NOT_CONFIGURED' ? 503 : 500).json({ status: false, code: e.code || 'MEDIA_QUOTA_ERROR', message: e.message }); }
 });
 app.post('/api/media/authorize', requireUser, async (req, res) => {
-  try { const out = await mediaQuota.authorize({ uid: req.user.uid, bytes: req.body && req.body.bytes, resourceType: req.body && req.body.resourceType, fileName: req.body && req.body.fileName }); res.json({ status: true, ...out }); }
+  try { const out = await mediaQuota.authorize({ uid: req.user.uid, email: req.user.email, bytes: req.body && req.body.bytes, resourceType: req.body && req.body.resourceType, fileName: req.body && req.body.fileName }); res.json({ status: true, ...out }); }
   catch (e) { const status = e.code === 'CLOUDINARY_NOT_CONFIGURED' || e.code === 'FIREBASE_ADMIN_NOT_CONFIGURED' ? 503 : (e.code === 'MEDIA_QUOTA_EXCEEDED' || e.code === 'DAILY_MEDIA_LIMIT' || e.code === 'MEDIA_FILE_TOO_LARGE' ? 413 : 400); res.status(status).json({ status: false, code: e.code || 'MEDIA_AUTHORIZE_FAILED', message: e.message }); }
 });
 app.post('/api/media/reservations/:id/release', requireUser, async (req, res) => { try { res.json({ status: true, result: await mediaQuota.release(req.user.uid, req.params.id, req.body && req.body.publicId, req.body && req.body.resourceType) }); } catch (e) { res.status(e.code === 'FORBIDDEN' ? 403 : 400).json({ status: false, code: e.code || 'MEDIA_RELEASE_FAILED', message: e.message }); } });
