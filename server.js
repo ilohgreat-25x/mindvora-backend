@@ -723,6 +723,7 @@ app.post('/api/paystack/webhook', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 // Public: only true/false flags, no secrets. Open it in a browser to see what is missing.
 require('./lib/aria').mount(app, { userFromRequest });
+require('./lib/bug-monitor').mount(app);
 require('./lib/live-content').mount(app);
 require('./lib/live-news').mount(app);   // Stream Live News: 10 official 24/7 news channels (8 international, 2 Nigerian)
 require('./lib/referral-switch').mount(app, { requireUser });   // owner's referral ON/OFF switch + notify every user on ON
