@@ -34,6 +34,7 @@ const mailer   = require('./lib/mailer');
 const husmo    = require('./lib/husmo');
 const catalog  = require('./lib/catalog');
 const payments = require('./lib/payments');
+const subscriptions = require('./lib/subscriptions');
 const { requireUser, userFromRequest, verifyIdTokenAny } = require('./lib/auth-user');
 const { admin: fbAdmin, db: fdb, auth: fauth, firebaseAdminConfigured, firebaseAdminError } = require('./lib/firebase-admin');
 const { verifyRecaptcha }                                 = require('./lib/recaptcha');
@@ -665,6 +666,8 @@ app.post('/api/paystack/initialize', requireUser, async (req, res) => {
   const { purpose, params, callbackUrl } = req.body || {};
   const secret = process.env.PAYSTACK_SECRET_KEY;
   if (!secret) return res.status(503).json({ status: false, message: 'Paystack is not configured yet (PAYSTACK_SECRET_KEY missing).' });
+  const paymentEmail = String((req.user && req.user.email) || (req.body && req.body.billingEmail) || '').trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(paymentEmail) || paymentEmail.length > 254) return res.status(400).json({ status: false, message: 'A valid billing email is required for Paystack checkout.' });
   const priced = await payments.priceAny(purpose, params, req.user.uid);
   if (!priced.ok) return res.status(400).json({ status: false, message: priced.message });
   try {
@@ -672,7 +675,7 @@ app.post('/api/paystack/initialize', requireUser, async (req, res) => {
       method: 'POST',
       headers: { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        email: req.user.email, amount: catalog.usdToKobo(priced.usd), currency: 'NGN',
+        email: paymentEmail, amount: catalog.usdToKobo(priced.usd), currency: 'NGN',
         reference: `MV-${purpose}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
         metadata: { uid: req.user.uid, purpose, params: priced.params },
         callback_url: typeof callbackUrl === 'string' && /^https?:\/\//.test(callbackUrl) ? callbackUrl : undefined,
@@ -700,6 +703,9 @@ app.post('/api/pay/paystack/verify', requireUser, async (req, res) => {
   }
 });
 
+// Recurring Premium billing is separately opt-in; existing one-time checkout remains unchanged.
+subscriptions.mount(app, { requireUser });
+
 /** Paystack webhook — backup path so a payment is applied even if the user closes the tab. */
 app.post('/api/paystack/webhook', async (req, res) => {
   const secret = process.env.PAYSTACK_SECRET_KEY || '';
@@ -708,9 +714,23 @@ app.post('/api/paystack/webhook', async (req, res) => {
   if (!expected || sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
     return res.status(401).send('Invalid signature');
   }
-  res.status(200).send('OK'); // acknowledge fast, process after
+  let evt;
+  try { evt = JSON.parse(req.rawBody.toString('utf8')); }
+  catch (_) { return res.status(400).send('Invalid event'); }
+  const subscriptionEvents = new Set(['subscription.create', 'subscription.not_renew', 'subscription.disable', 'invoice.update', 'invoice.payment_failed']);
+  if (subscriptionEvents.has(evt.event)) {
+    if (!firebaseAdminConfigured()) return res.status(503).send('Billing storage unavailable');
+    try {
+      const processed = await subscriptions.handleWebhookEvent(evt);
+      if (!processed) return res.status(500).send('Subscription event is not mapped yet');
+      return res.status(200).send('OK');
+    } catch (err) {
+      console.error('[PAYSTACK] subscription webhook processing error:', err.message);
+      return res.status(500).send('Subscription event not processed');
+    }
+  }
+  res.status(200).send('OK'); // acknowledge ordinary payment events fast, process after
   try {
-    const evt = JSON.parse(req.rawBody.toString('utf8'));
     if (evt.event === 'charge.success' && evt.data && evt.data.reference && firebaseAdminConfigured()) {
       const out = await payments.confirmPaystack(evt.data.reference, null);
       if (!out.ok) console.warn('[PAYSTACK] webhook not fulfilled:', out.code, out.message);
