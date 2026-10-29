@@ -665,6 +665,9 @@ app.post('/api/otp/verify-email', async (req, res) => {
 app.post('/api/paystack/initialize', requireUser, async (req, res) => {
   const { purpose, params, callbackUrl } = req.body || {};
   const secret = process.env.PAYSTACK_SECRET_KEY;
+  if (purpose === 'ad' || purpose === 'ad_subscription') {
+    return res.status(400).json({ status: false, message: 'Paid ad packages are billed monthly only through the explicit recurring-consent checkout.' });
+  }
   if (!secret) return res.status(503).json({ status: false, message: 'Paystack is not configured yet (PAYSTACK_SECRET_KEY missing).' });
   const paymentEmail = String((req.user && req.user.email) || (req.body && req.body.billingEmail) || '').trim().toLowerCase();
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(paymentEmail) || paymentEmail.length > 254) return res.status(400).json({ status: false, message: 'A valid billing email is required for Paystack checkout.' });
@@ -703,8 +706,199 @@ app.post('/api/pay/paystack/verify', requireUser, async (req, res) => {
   }
 });
 
-// Recurring Premium billing is separately opt-in; existing one-time checkout remains unchanged.
+// Recurring subscription status and checkout routes.
 subscriptions.mount(app, { requireUser });
+
+const APP_ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || 'ilohgreat25@gmail.com').trim().toLowerCase();
+function isAppOwner(req) {
+  return req.user && req.user.email_verified === true
+    && String(req.user.email || '').trim().toLowerCase() === APP_ADMIN_EMAIL;
+}
+function withdrawalError(res, error) {
+  const code = Number(error && error.status) || 500;
+  return res.status(code).json({ status: false, message: code < 500 ? error.message : 'Could not process the withdrawal request.' });
+}
+function cleanWithdrawalField(value, max) {
+  return String(value || '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, max);
+}
+
+app.post('/api/withdrawals/request', requireUser, async (req, res) => {
+  if (!firebaseAdminConfigured()) return res.status(503).json({ status: false, message: 'Withdrawal service unavailable.' });
+  const body = req.body || {};
+  const gross = Number(body.amount);
+  const rawMethod = String(body.method || '').trim().toLowerCase();
+  const method = rawMethod === 'mobile_money' ? 'momo' : rawMethod;
+  if (!Number.isFinite(gross) || Math.abs(gross * 100 - Math.round(gross * 100)) > 1e-6 || gross < 20) {
+    return res.status(400).json({ status: false, message: 'Withdrawal amount must be at least $20 with at most two decimals.' });
+  }
+  if (!['bank', 'crypto', 'paypal', 'momo'].includes(method)) {
+    return res.status(400).json({ status: false, message: 'Choose a supported withdrawal method.' });
+  }
+  const destination = {};
+  if (method === 'bank') {
+    destination.bankName = cleanWithdrawalField(body.bankName, 100);
+    destination.accountName = cleanWithdrawalField(body.accountName, 120);
+    destination.bankAccount = cleanWithdrawalField(body.bankAccount || body.accountNumber, 34).replace(/\s/g, '');
+    if (!destination.bankName || !destination.accountName || !/^[A-Za-z0-9-]{6,34}$/.test(destination.bankAccount)) {
+      return res.status(400).json({ status: false, message: 'Provide a bank name, account name and valid account number.' });
+    }
+  } else if (method === 'crypto') {
+    destination.walletAddress = cleanWithdrawalField(body.walletAddress, 200);
+    destination.cryptoCoin = cleanWithdrawalField(body.cryptoCoin || body.network, 50);
+    if (destination.walletAddress.length < 20 || !destination.cryptoCoin) {
+      return res.status(400).json({ status: false, message: 'Provide a valid wallet address and cryptocurrency/network.' });
+    }
+  } else if (method === 'paypal') {
+    destination.paypalEmail = cleanWithdrawalField(body.paypalEmail, 254).toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(destination.paypalEmail)) {
+      return res.status(400).json({ status: false, message: 'Provide a valid PayPal email.' });
+    }
+  } else {
+    destination.momoPhone = cleanWithdrawalField(body.momoPhone || body.phone, 40);
+    destination.momoProvider = cleanWithdrawalField(body.momoProvider || body.provider, 80);
+    destination.momoName = cleanWithdrawalField(body.momoName || body.accountName, 120);
+    if (!destination.momoPhone || !destination.momoProvider || !destination.momoName) {
+      return res.status(400).json({ status: false, message: 'Provide a mobile-money number, provider and account name.' });
+    }
+  }
+
+  try {
+    const uid = req.user.uid;
+    const userRef = fdb().collection('users').doc(uid);
+    const withdrawalRef = fdb().collection('withdrawals').doc();
+    const subscriptionsQuery = fdb().collection('billing_subscriptions').where('uid', '==', uid);
+    let availableBalance = 0;
+    let feeAmount = 0;
+    let netAmount = 0;
+    let feeWaived = false;
+    await fdb().runTransaction(async (transaction) => {
+      const [userSnap, subscriptionsSnap] = await Promise.all([transaction.get(userRef), transaction.get(subscriptionsQuery)]);
+      if (!userSnap.exists) throw Object.assign(new Error('User account not found.'), { status: 404 });
+      const user = userSnap.data() || {};
+      const now = Date.now();
+      const premiumEndValue = user.premiumExpiresAt;
+      const premiumEndDate = premiumEndValue && typeof premiumEndValue.toDate === 'function'
+        ? premiumEndValue.toDate()
+        : (premiumEndValue ? new Date(premiumEndValue) : null);
+      const premiumEndMs = premiumEndDate && Number.isFinite(premiumEndDate.getTime()) ? premiumEndDate.getTime() : null;
+      const activePremium = user.isPremium === true && premiumEndMs !== null && premiumEndMs > now;
+      const activeRecurring = subscriptionsSnap.docs.some((doc) => {
+        const subscription = doc.data() || {};
+        const status = String(subscription.status || '').toLowerCase();
+        const endValue = subscription.currentPeriodEnd || subscription.nextPaymentDate;
+        const endDate = endValue && typeof endValue.toDate === 'function' ? endValue.toDate() : (endValue ? new Date(endValue) : null);
+        const endMs = endDate && Number.isFinite(endDate.getTime()) ? endDate.getTime() : null;
+        const recognizedProduct = subscription.productType === 'ad' || !!catalog.PLANS[subscription.planId];
+        const paymentStatus = String(subscription.lastPaymentStatus || '').toLowerCase();
+        const paidStatus = ['active', 'attention', 'non-renewing', 'non_renewing', 'disabled'].includes(status);
+        // Disabled/non-renewing subscriptions waive the fee only while their recorded paid-through date remains current.
+        const stillPaidThrough = endMs === null ? status !== 'disabled' : endMs > now;
+        return recognizedProduct && paidStatus && stillPaidThrough && !['refunded', 'refund_pending'].includes(paymentStatus);
+      });
+      feeWaived = activePremium || activeRecurring;
+      const earnings = Number(user.earnings || 0);
+      if (!Number.isFinite(earnings) || earnings < gross) throw Object.assign(new Error('Insufficient available earnings.'), { status: 400 });
+      feeAmount = feeWaived ? 0 : Math.round(gross * 2) / 100;
+      netAmount = Math.round((gross - feeAmount) * 100) / 100;
+      availableBalance = Math.round((earnings - gross) * 100) / 100;
+      const stamp = fbAdmin.firestore.FieldValue.serverTimestamp();
+      transaction.update(userRef, { earnings: availableBalance });
+      transaction.set(withdrawalRef, {
+        grossAmount: gross,
+        feeAmount,
+        netAmount,
+        amount: netAmount,
+        feeWaived,
+        uid,
+        name: cleanWithdrawalField(user.name || 'Mindvora user', 120),
+        email: cleanWithdrawalField(user.email || req.user.email || '', 254),
+        method,
+        ...destination,
+        status: 'pending',
+        requestedAt: stamp,
+        createdAt: stamp,
+      });
+    });
+    return res.json({ status: true, withdrawalId: withdrawalRef.id, grossAmount: gross, feeAmount, netAmount, feeWaived, availableBalance });
+  } catch (error) {
+    return withdrawalError(res, error);
+  }
+});
+
+app.get('/api/admin/withdrawals', requireUser, async (req, res) => {
+  if (!isAppOwner(req)) return res.status(403).json({ status: false, message: 'Admin only.' });
+  if (!firebaseAdminConfigured()) return res.status(503).json({ status: false, message: 'Withdrawal service unavailable.' });
+  try {
+    const snapshot = await fdb().collection('withdrawals').where('status', '==', 'pending').limit(250).get();
+    const withdrawals = snapshot.docs.map((doc) => Object.assign({ id: doc.id }, doc.data()))
+      .filter((item) => item.status === 'pending')
+      .sort((a, b) => {
+        const av = a.createdAt && typeof a.createdAt.toMillis === 'function' ? a.createdAt.toMillis() : 0;
+        const bv = b.createdAt && typeof b.createdAt.toMillis === 'function' ? b.createdAt.toMillis() : 0;
+        return bv - av;
+      });
+    return res.json({ status: true, withdrawals });
+  } catch (error) {
+    return res.status(500).json({ status: false, message: 'Could not load withdrawal requests.' });
+  }
+});
+
+app.post('/api/admin/withdrawals/:id/resolve', requireUser, async (req, res) => {
+  if (!isAppOwner(req)) return res.status(403).json({ status: false, message: 'Admin only.' });
+  if (!firebaseAdminConfigured()) return res.status(503).json({ status: false, message: 'Withdrawal service unavailable.' });
+  const id = String(req.params.id || '');
+  const desired = String(req.body && req.body.status || '').toLowerCase();
+  const reason = cleanWithdrawalField(req.body && req.body.reason, 240);
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(id) || !['paid', 'rejected'].includes(desired)) {
+    return res.status(400).json({ status: false, message: 'Invalid withdrawal resolution.' });
+  }
+  try {
+    const withdrawalRef = fdb().collection('withdrawals').doc(id);
+    const platformRef = fdb().collection('platform').doc('revenue');
+    const ledgerRef = fdb().collection('platform_ledger').doc('withdrawal_' + id);
+    const result = await fdb().runTransaction(async (transaction) => {
+      const withdrawalSnap = await transaction.get(withdrawalRef);
+      if (!withdrawalSnap.exists) throw Object.assign(new Error('Withdrawal request not found.'), { status: 404 });
+      const withdrawal = withdrawalSnap.data() || {};
+      if (withdrawal.status !== 'pending') {
+        if (withdrawal.status === desired) return { changed: false, status: desired, uid: withdrawal.uid };
+        throw Object.assign(new Error('This withdrawal request was already resolved.'), { status: 409 });
+      }
+      const gross = Number(withdrawal.grossAmount != null ? withdrawal.grossAmount : withdrawal.amount);
+      const fee = Number(withdrawal.feeAmount || 0);
+      const net = Number(withdrawal.netAmount != null ? withdrawal.netAmount : Number(withdrawal.amount || 0));
+      if (!Number.isFinite(gross) || gross < 0 || !Number.isFinite(fee) || fee < 0 || !Number.isFinite(net) || net < 0) {
+        throw Object.assign(new Error('Withdrawal amount data is invalid.'), { status: 409 });
+      }
+      const stamp = fbAdmin.firestore.FieldValue.serverTimestamp();
+      if (desired === 'rejected') {
+        const userRef = fdb().collection('users').doc(String(withdrawal.uid || ''));
+        const userSnap = await transaction.get(userRef);
+        if (!userSnap.exists) throw Object.assign(new Error('User account not found; withdrawal remains pending.'), { status: 409 });
+        const current = Number(userSnap.data().earnings || 0);
+        if (!Number.isFinite(current)) throw Object.assign(new Error('User earnings balance is invalid.'), { status: 409 });
+        transaction.update(userRef, { earnings: Math.round((current + gross) * 100) / 100 });
+        transaction.update(withdrawalRef, { status: 'rejected', rejectionReason: reason, resolvedBy: APP_ADMIN_EMAIL, resolvedAt: stamp, returnedGross: gross });
+      } else {
+        transaction.update(withdrawalRef, { status: 'paid', resolutionNote: reason, resolvedBy: APP_ADMIN_EMAIL, resolvedAt: stamp, paidAt: stamp });
+        if (fee > 0) {
+          transaction.set(ledgerRef, { kind: 'withdrawal_fee', uid: withdrawal.uid, gross, fee, net, reference: id, createdAt: stamp });
+          transaction.set(platformRef, { withdrawalFeeTotal: fbAdmin.firestore.FieldValue.increment(fee), updatedAt: stamp }, { merge: true });
+        }
+      }
+      return { changed: true, status: desired, uid: withdrawal.uid, gross, fee, net };
+    });
+    if (result.changed && result.uid) {
+      const text = desired === 'paid'
+        ? `Your withdrawal request has been marked paid. Net payout: $${Number(result.net || 0).toFixed(2)}.`
+        : `Your withdrawal request was rejected; the gross amount of $${Number(result.gross || 0).toFixed(2)} has been returned to your earnings.`;
+      await fdb().collection('notifications').add({ toUid: result.uid, type: 'withdrawal', text, read: false, createdAt: fbAdmin.firestore.FieldValue.serverTimestamp() }).catch(() => {});
+    }
+    return res.json({ status: true, ...result });
+  } catch (error) {
+    return withdrawalError(res, error);
+  }
+});
 
 /** Paystack webhook — backup path so a payment is applied even if the user closes the tab. */
 app.post('/api/paystack/webhook', async (req, res) => {
